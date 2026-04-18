@@ -228,19 +228,23 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
         s->read_pos++;
         break;
     case APPLESMC_GET_KEY_TYPE_CMD:
-        /* mos15: Return key type info. AppleSMC uses GET_KEY_TYPE (0x13) to
-         * query type/size/attributes. The data phase receives the 4-byte key
-         * name, then a 1-byte length request. Response is 6 bytes:
-         * [type0][type1][type2][type3][data_len][attributes] */
+        /* mos15: Return key type info. Protocol (from VirtualSMC):
+         * - Receive 4 bytes of key name
+         * - After 4th byte, immediately set DATA_READY with response
+         * - Response is 6 bytes: type[4] + size[1] + attr[1]
+         * NO length byte between key name and response (unlike READ_CMD). */
         if ((s->status & 0x0f) == APPLESMC_ST_CMD_DONE) {
             break;
         }
-        if (s->read_pos < 4) {
+        if (s->read_pos < 3) {
             s->key[s->read_pos] = val;
             s->status = APPLESMC_ST_ACK;
-        } else if (s->read_pos == 4) {
+        } else if (s->read_pos == 3) {
+            /* 4th and final key byte. Unlike READ_CMD which has a 5th byte
+             * for data length, GET_KEY_TYPE responds immediately after the
+             * 4-byte key name (matching VirtualSMC kern_pmio.cpp behavior). */
+            s->key[3] = val;
             d = applesmc_find_key(s);
-            /* Type: "ui8 " for 1-byte, "ui16" for 2-byte, "ui32" for 4-byte */
             if (d != NULL) {
                 switch (d->len) {
                 case 1:
@@ -261,9 +265,9 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
                     break;
                 }
                 s->data[4] = d->len;
-                s->data[5] = 0xD0;  /* attr: readable | writable | function */
+                s->data[5] = 0xD0;
             } else {
-                fprintf(stderr, "mos15-smc: GET_KEY_TYPE unknown key '%c%c%c%c'\n",
+                fprintf(stderr, "mos15-smc: GET_KEY_TYPE unknown '%c%c%c%c'\n",
                         s->key[0], s->key[1], s->key[2], s->key[3]);
                 s->data[0] = 'u'; s->data[1] = 'i';
                 s->data[2] = '8'; s->data[3] = ' ';
@@ -278,15 +282,16 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
         s->read_pos++;
         break;
     case APPLESMC_GET_KEY_BY_INDEX_CMD:
-        /* mos15: Return empty for key-by-index queries.
-         * macOS uses this to enumerate all keys. */
+        /* mos15: Return key name by index. VirtualSMC receives a 4-byte
+         * big-endian index, responds with 4-byte key name. */
         if ((s->status & 0x0f) == APPLESMC_ST_CMD_DONE) {
             break;
         }
-        if (s->read_pos < 4) {
+        if (s->read_pos < 3) {
             s->key[s->read_pos] = val;
             s->status = APPLESMC_ST_ACK;
-        } else if (s->read_pos == 4) {
+        } else if (s->read_pos == 3) {
+            s->key[3] = val;
             memset(s->data, 0, 4);
             s->data_len = 4;
             s->data_pos = 0;
