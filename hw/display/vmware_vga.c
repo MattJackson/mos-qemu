@@ -218,10 +218,10 @@ enum {
 #define SVGA_FIFO_FLAG_NONE             0
 #define SVGA_FIFO_FLAG_ACCELFRONT       (1 << 0)
 
-/* These values can probably be changed arbitrarily.  */
+/* mos15: Raised to 4K for Retina display support (was 2368x1770) */
 #define SVGA_SCRATCH_SIZE               0x8000
-#define SVGA_MAX_WIDTH                  2368
-#define SVGA_MAX_HEIGHT                 1770
+#define SVGA_MAX_WIDTH                  3840
+#define SVGA_MAX_HEIGHT                 2160
 
 #ifdef VERBOSE
 # define GUEST_OS_BASE          0x5001
