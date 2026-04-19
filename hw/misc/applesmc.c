@@ -488,8 +488,7 @@ static void applesmc_isa_realize(DeviceState *dev, Error **errp)
     applesmc_add_key(s, "WDTC", 1, "\x00");
 
     /* mos15: GPU temperature sensors — iMac20,1 has dGPU temp reporting.
-     * Values pulled from /Users/mjackson/mos/imac20-1-hardware-reference.md
-     * §6 (real iMac20,1 sensor readings). SP78 format: 16-bit big-endian,
+     * Values from real iMac20,1 sensor readings. SP78 format: 16-bit big-endian,
      * top 8 bits = integer °C, bottom 8 bits = fraction. Returning 0 made
      * macOS flag these as broken sensors and retry-poll. */
     applesmc_add_key(s, "TGDD", 2, "\x46\x00");  /* GPU diode: 70°C */
