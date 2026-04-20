@@ -21,6 +21,9 @@
 #include "system/dma.h"
 #include "migration/blocker.h"
 #include "ui/console.h"
+#include "hw/qdev-properties.h"
+#include "hw/pci/msi.h"
+#include "hw/pci/pci.h"
 #include "apple-gfx-linux.h"
 #include "trace.h"
 
