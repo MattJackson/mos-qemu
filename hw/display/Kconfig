@@ -151,12 +151,6 @@ config MAC_PVG_PCI
     default y if PCI_DEVICES
 
 config APPLE_GFX_PCI_LINUX
-    bool "Apple ParavirtualizedGraphics PCI device (Linux)"
+    bool
     default y if PCI_DEVICES
     depends on PCI
-    help
-      Enable the Linux-compatible Apple ParavirtualizedGraphics PCI
-      device. Requires libapplegfx-vulkan library with lavapipe Vulkan
-      backend. The runtime dependency is gated at the meson level —
-      if libapplegfx-vulkan is not found via pkg-config, the device
-      source files are dropped from the build even if this symbol is y.
