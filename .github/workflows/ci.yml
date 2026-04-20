@@ -78,6 +78,7 @@ jobs:
           cp fork/hw/display/apple-gfx-linux.h        qemu-src/hw/display/
           cp fork/hw/display/meson.build              qemu-src/hw/display/meson.build
           cp fork/hw/display/Kconfig                  qemu-src/hw/display/Kconfig
+          cp fork/hw/display/trace-events             qemu-src/hw/display/trace-events
 
       - name: Configure QEMU enough to generate build headers
         working-directory: qemu-src
