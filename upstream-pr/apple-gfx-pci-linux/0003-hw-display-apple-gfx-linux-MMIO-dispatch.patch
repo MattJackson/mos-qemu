@@ -7,13 +7,24 @@ authoritative decoder for the register layout - it mirrors
 Apple's ParavirtualizedGraphics.framework's internal
 dispatch and returns a single 32-bit value per read.
 
+`MemoryRegionOps` is configured with a 4-byte `impl` and
+4..8-byte `valid` range, matching the macOS sibling.
+
+As of the current library release (`libapplegfx-vulkan`
+8edc43c), the MMIO dispatch covers the P0 and P1 opcode
+families (NOP, Debug, GetDeviceInfo, DefineTask2,
+DeleteTask, DefineChildFIFO, DeleteChildFIFO,
+SynchronizeResources, MapMemory2, UnmapMemory,
+ExecIndirect2) plus the display-plane opcodes (DisplayAck,
+DisplaySwapMapping, DisplayTransaction3). The QEMU shell is
+transport-agnostic: it forwards MMIO reads/writes verbatim,
+so new opcodes introduced upstream in the library require
+no QEMU change.
+
 Trace events `apple_gfx_read` / `apple_gfx_write` are
 already defined by the upstream apple-gfx.m sibling (shared
 `hw/display/trace-events`). The Linux port reuses those
 without adding new entries.
-
-MemoryRegionOps is configured with 4-byte impl and 8-byte
-valid ranges, matching the macOS sibling.
 
 Signed-off-by: Matthew Jackson <matthew@pq.io>
 ---

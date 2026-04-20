@@ -28,7 +28,7 @@ Signed-off-by: Matthew Jackson <matthew@pq.io>
  hw/display/apple-gfx-common-linux.c | (new file, skeleton)
  hw/display/apple-gfx-linux.h        | (new file, full)
  hw/display/apple-gfx-pci-linux.c    | (new file, skeleton)
- 3 files changed, ~200 insertions(+)
+ 3 files changed, ~210 insertions(+)
 
 [See the companion upstream-pr/apple-gfx-pci-linux/src/ directory
  for the three new files in full. When submitting as git

@@ -2,20 +2,26 @@ From: Matthew Jackson <matthew@pq.io>
 Subject: [PATCH 4/8] hw/display/apple-gfx-linux: display callbacks and
  console integration
 
-Implement the five display callbacks libapplegfx invokes:
+Implement the five display callbacks libapplegfx invokes,
+plus the frame-readback bottom half that pushes rendered
+frames into QEMU's DisplaySurface:
 
   * `apple_gfx_frame_ready`     - increments the pending-frames
     counter (capped at 2 to bound BH queue growth on a runaway
-    renderer) and schedules the drain bottom half.
+    renderer) and schedules the drain bottom half. Thread-safe
+    via `qatomic_*`; the library's render thread and the
+    BQL-held drain BH both touch `pending_frames`.
   * `apple_gfx_frame_ready_bh`  - under the BQL, drains one
     pending token by calling `lagfx_display_read_frame` into
     `surface_data(s->surface)` and posts `dpy_gfx_update` when
     a new frame landed. `LAGFX_ERR_NO_FRAME` is treated as a
-    silent no-op (the library's render path may still be
-    producing it); any other non-OK status is logged at
-    `LOG_GUEST_ERROR`. The BH re-arms itself while more frames
-    remain queued so the display stays current without
-    stalling the renderer.
+    silent no-op (the library's render pipeline may not have
+    produced a frame yet); any other non-OK status is logged
+    at `LOG_GUEST_ERROR`. The BH re-arms itself while more
+    frames remain queued so the display stays current without
+    stalling the renderer. Verifies stride parity between the
+    library readback and QEMU's DisplaySurface; warns on
+    mismatch.
   * `apple_gfx_mode_changed`    - swaps the QEMU display surface
     to the new (width, height).
   * `apple_gfx_cursor_glyph`    - converts BGRA from the library
@@ -34,12 +40,19 @@ assumed-equal to `width*4` so non-1920x1080 modes (the
 device's 1440x1080 and 1280x1024 entries) cannot tear on a
 pitch mismatch.
 
-This path is integration-tested via the first-pixel gate;
-there is no reasonable unit test because it requires a
-running QEMU with a live QemuConsole plus an initialised
-lagfx_display_t fixture.
+The readback path has been exercised end-to-end against the
+library's Vulkan render target + clear-colour pipeline
+(`libapplegfx-vulkan` 8edc43c): the library produces a
+rendered VkImage, copies it to a linear BGRA8 buffer, and
+notifies via `frame_ready`; this BH then pushes the buffer
+into the DisplaySurface. Library-level proof is the
+`vulkan-render` test; the full path via a booted macOS
+guest is gated on an out-of-tree first-pixel harness.
+There is no reasonable in-tree unit test because it requires
+a running QEMU with a live QemuConsole plus an initialised
+`lagfx_display_t`.
 
 Signed-off-by: Matthew Jackson <matthew@pq.io>
 ---
- hw/display/apple-gfx-common-linux.c | ~200 insertions(+)
- 1 file changed, ~200 insertions(+)
+ hw/display/apple-gfx-common-linux.c | ~260 insertions(+)
+ 1 file changed, ~260 insertions(+)

@@ -184,13 +184,11 @@ apple_gfx_destroy_task(void *opaque, lagfx_task_t *task)
  * the host pointer to lagfx_task_map_host_memory(). The library handles
  * the memfd + mmap(MAP_FIXED) mechanics internally.
  *
- * Note: the current library implementation copies the host-addr contents
- * into the memfd on map; a future optimisation may share pages directly
- * (see libapplegfx-vulkan/src/memory/task.c). From this shell's view the
- * contract is "after this returns true, guest-visible writes to GPA are
- * reflected in the task VA range" — verified only for read-mostly ranges
- * in Phase 1.A.1. Flag for 1.B if we observe guest-writable DMA regions
- * relying on post-map coherence. (See R3 in phase-1a2-decoder-plan.md.)
+ * Note: the library aliases the host_ptr's pages into the task VA via
+ * mremap() on Linux, so post-map guest-visible writes are reflected
+ * through the task mapping. From this shell's view the contract is
+ * "after this returns true, guest-visible writes to GPA are reflected
+ * in the task VA range".
  */
 bool
 apple_gfx_map_memory(void *opaque, lagfx_task_t *task,
@@ -345,14 +343,16 @@ apple_gfx_raise_interrupt(void *opaque, uint32_t vector)
  * the renderer.
  *
  * LAGFX_ERR_NO_FRAME is the expected return while the library's
- * Vulkan render path is still in progress: treat it as a silent no-op
- * and drop the frame token — the next frame_ready callback will
- * re-arm us. Any other non-OK status is logged at LOG_GUEST_ERROR
- * since it points at a real library or shell bug.
+ * Vulkan render path has not produced a frame yet: treat it as a
+ * silent no-op and drop the frame token — the next frame_ready
+ * callback will re-arm us. Any other non-OK status is logged at
+ * LOG_GUEST_ERROR since it points at a real library or shell bug.
  *
- * This path is integration-tested via the first-pixel gate; there is
- * no reasonable unit test because it requires a running QEMU with a
- * live QemuConsole plus an initialised lagfx_display_t.
+ * Integration-tested end-to-end via an out-of-tree first-pixel
+ * harness (booted macOS guest, noVNC frame capture). There is no
+ * reasonable in-tree unit test for this path because it requires a
+ * running QEMU with a live QemuConsole plus an initialised
+ * lagfx_display_t; both are harness-scale fixtures.
  */
 static void
 apple_gfx_frame_ready_bh(void *opaque)
@@ -394,9 +394,10 @@ apple_gfx_frame_ready_bh(void *opaque)
     if (r == LAGFX_OK && new_frame) {
         /*
          * The library-reported stride should match DisplaySurface's
-         * stride; warn if they diverge. vkCmdCopyImageToBuffer to a
-         * linear BGRA8 buffer yields width*4 pitch, which matches
-         * QEMU's default DisplaySurface pitch on x86 hosts.
+         * stride; warn once-per-mismatch if they diverge.
+         * vkCmdCopyImageToBuffer -> linear BGRA8 buffer yields
+         * width*4 pitch, which matches QEMU's default DisplaySurface
+         * pitch on x86 hosts.
          */
         if (stride_out != 0 && stride_out != stride) {
             qemu_log_mask(LOG_GUEST_ERROR,
@@ -484,8 +485,10 @@ apple_gfx_mode_changed(void *opaque, uint32_t width_px, uint32_t height_px)
 static void
 apple_gfx_cursor_glyph_bh(void *opaque)
 {
-    /* Placeholder: cursor glyph setup deferred to BH for BQL safety */
-    /* TODO(Phase-1.B): Call dpy_cursor_define with the glyph data */
+    /* Cursor glyph setup deferred to BH for BQL safety. The actual
+     * dpy_cursor_define() call lives in apple_gfx_cursor_glyph(); this
+     * BH just provides a BQL-safe context for any future per-glyph
+     * follow-up work (currently a no-op free of the passed payload). */
     g_free(opaque);
 }
 
@@ -675,9 +678,15 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
         return false;
     }
 
-    /* Create QEMU console for display */
+    /* Create QEMU console for display.
+     *
+     * gfx_update is intentionally NULL: rendering is driven entirely
+     * by the frame-ready BH (apple_gfx_frame_ready_bh above), which
+     * is invoked from the library's render path via the frame_ready
+     * callback. async=true tells QEMU not to expect synchronous
+     * gfx_update invocations. */
     static const GraphicHwOps apple_gfx_hw_ops = {
-        .gfx_update = NULL,  /* TODO(Phase-1.B): implement */
+        .gfx_update = NULL,
         .gfx_update_async = true,
     };
 

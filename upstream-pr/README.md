@@ -11,9 +11,24 @@ description (`PR_DESCRIPTION.md`), and a testing recipe
 | Package | Subject | Size | Status |
 |---------|---------|-----:|--------|
 | [A](./applesmc-fix/) | Fix `GET_KEY_BY_INDEX` and populate boot keys | 4 patches | **Ready to submit** |
-| [B](./apple-gfx-pci-linux/) | Linux-host port of `apple-gfx-pci` | 8 patches | **Draft; blocked on libapplegfx-vulkan packaging** |
+| [B](./apple-gfx-pci-linux/) | Linux-host port of `apple-gfx-pci` | 8 patches | **Blocked-ready** (library at `8edc43c`, packaging-path decision pending) |
 | [C](./vmware-svga-caps/) | VMware SVGA II capability bits + 5K cap | 4 patches | **Ready to submit** |
 | [D](./usb-hid-apple-ids/) | USB HID Apple vendor IDs | 3 patches | **Ready to submit** |
+
+Ready-to-submit: A, C, D (3 of 4). B is "blocked-ready":
+the library side (`libapplegfx-vulkan`) has reached a stable
+public API at commit `8edc43c` (Phase 2.B complete —
+clear-colour render target + readback, displays render
+end-to-end at the library level today); the QEMU-side
+frame-readback BH is wired live; submission is waiting only
+on the library packaging path (system package / meson
+subproject / vendored submodule — see Package B's
+`LIBAPPLEGFX_DEPENDENCY.md`). Precedent for upstream fork
+submissions from this tree: our OpenCorePkg submission
+(acidanthera/OpenCorePkg PR, similar hand-off shape) — the
+next step for B is a discussion with the upstream maintainer
+on which of the three library-packaging options they prefer
+to review.
 
 ## Per-package status
 
@@ -31,7 +46,7 @@ key set.
 Dependencies: none.
 Ready to submit: **yes, immediately**.
 
-### B - apple-gfx-pci Linux port (blocked)
+### B - apple-gfx-pci Linux port (blocked-ready)
 
 Companion to Phil Dennis-Jordan's upstream apple-gfx.m /
 apple-gfx-pci.m work. Adds a Linux C port that drives the
@@ -39,16 +54,52 @@ same PGDevice protocol via `libapplegfx-vulkan` (a Mesa
 lavapipe-backed shell reimplementation). Zero upstream
 files are modified; additive only.
 
-Dependencies: **hard blocker on `libapplegfx-vulkan`
+Eight patches total, adding the device, its `gpu_cores=N`
+tunable, the meson + Kconfig gate, and a placeholder option
+ROM blob in pc-bios.
+
+**Library-side state** (as of this revision):
+`libapplegfx-vulkan` at commit `8edc43c` implements Phase
+1.A through Phase 2.B:
+
+  * Task-memory management (memfd + mmap(MAP_FIXED), with
+    mremap-based page aliasing for coherence).
+  * MMIO dispatch with P0 + P1 + display-plane opcodes.
+  * Vulkan init + command pool + empty-submit round-trip.
+  * Vulkan clear-colour render target + image-to-buffer
+    readback, surfaced via the `frame_ready` callback.
+
+The full library test suite (`protocol-dispatch`,
+`vulkan-init`, `vulkan-command`, `vulkan-render`,
+`memory-coherence`, etc.) runs ~277 `CHECK` assertions on
+a Linux host with Mesa lavapipe installed; zero failures.
+The protocol-dispatch suite alone covers 207 assertions on
+the opcode decoder.
+
+On the QEMU side the frame-readback BH is now live
+(previously a draft): displays render clear-colour
+end-to-end at the library level today. Runtime surface:
+`-device apple-gfx-pci,gpu_cores=N` (with optional
+`-object memory-backend-memfd,share=on` for fast-path
+task-VA aliasing).
+
+Dependencies: **blocked on `libapplegfx-vulkan`
 packaging**. See
 [apple-gfx-pci-linux/LIBAPPLEGFX_DEPENDENCY.md](./apple-gfx-pci-linux/LIBAPPLEGFX_DEPENDENCY.md).
+The library is API-stable at the surface this series uses,
+so the decision at this point is procedural (which of the
+three packaging paths to review) rather than technical. The
+recommended path for the initial PR is Option 3 (vendored
+submodule under `subprojects/libapplegfx-vulkan/`).
 
 Secondary blockers: in-tree EDK2 build for the option ROM
 (currently a development placeholder); review by the
 `apple-gfx.m` author.
 
-Ready to submit: **no** - at least one of the dependency
-options must land first.
+Ready to submit: **library ready, packaging decision
+pending.** Next action: open a discussion with the upstream
+apple-gfx maintainer on which of the three library
+bundling paths they want to review first.
 
 ### C - vmware_vga capability bits (ready)
 

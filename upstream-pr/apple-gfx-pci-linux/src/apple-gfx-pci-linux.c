@@ -20,8 +20,7 @@
  * Upper bound on the `gpu_cores` property. Leaves headroom above Mesa
  * lavapipe's historical compile-time cap (LP_MAX_THREADS = 32) while
  * staying in sensible host territory; values above this clamp silently
- * to LAGFX_GPU_CORES_MAX with a warning. See
- * paravirt-re/gpu-cores-implementation-spec.md §1, §7.
+ * to LAGFX_GPU_CORES_MAX with a warning.
  */
 #define LAGFX_GPU_CORES_MAX 64u
 
@@ -38,8 +37,8 @@
  * `-device apple-gfx-pci,romfile=/path/to/other.rom` — the `romfile` property
  * is inherited from the base PCIDevice class (see hw/pci/pci.c).
  *
- * Phase 1.E: Apple's AppleParavirtEFI.rom is shipped during dev; Phase 5.X
- * replaces with own EDK2 build.
+ * See the separate pc-bios/apple-gfx-pci.rom patch for the blob itself
+ * and the status note on the in-tree EDK2 replacement.
  */
 #define PG_PCI_DEFAULT_ROMFILE "apple-gfx-pci.rom"
 
@@ -113,8 +112,7 @@ apple_gfx_pci_realize(PCIDevice *pci_dev, Error **errp)
      * Clamp >64 with a warning. 0 is the "unset; lavapipe default"
      * sentinel and passes straight through. No hard error on
      * over-range; operators may set high values intentionally (host
-     * CPU count, cgroup limit). See
-     * paravirt-re/gpu-cores-implementation-spec.md §7.
+     * CPU count, cgroup limit).
      */
     if (common->gpu_cores > LAGFX_GPU_CORES_MAX) {
         warn_report("apple-gfx-pci: gpu_cores=%u exceeds max %u; "
@@ -133,7 +131,7 @@ apple_gfx_pci_realize(PCIDevice *pci_dev, Error **errp)
      * Upstream hw/display/trace-events does not define apple_gfx_pci_realize
      * (the Darwin port inlined this into apple_gfx_common_init tracing).
      * Rather than carry a full trace-events overlay for two PCI-only trace
-     * points, log via qemu_log_mask(LOG_TRACE). See M1 dry-run audit.
+     * points, log via qemu_log_mask(LOG_TRACE).
      */
     qemu_log_mask(LOG_TRACE, "apple-gfx-pci: realize\n");
 }
@@ -186,7 +184,6 @@ static const Property apple_gfx_pci_properties[] = {
      * Vulkan init. Accepted values 0..LAGFX_GPU_CORES_MAX; higher
      * values are clamped at realize with a warning. Reset-only
      * (LP_NUM_THREADS is read by Mesa once, at Vulkan-ICD init).
-     * See paravirt-re/gpu-cores-implementation-spec.md.
      */
     DEFINE_PROP_UINT32("gpu_cores", AppleGFXPCIState, common.gpu_cores, 0),
     DEFINE_PROP_END_OF_LIST(),
@@ -211,14 +208,14 @@ apple_gfx_pci_class_init(ObjectClass *klass, const void *data)
     pci->realize = apple_gfx_pci_realize;
 
     /*
-     * Phase 1.E: Apple's AppleParavirtEFI.rom is shipped during dev;
-     * Phase 5.X replaces with own EDK2 build.
-     *
-     * This sets the default ROM. It can be overridden at instantiation via
+     * Default option ROM shipped via pc-bios/ by the companion patch in
+     * this series. It can be overridden at instantiation via
      *   -device apple-gfx-pci,romfile=/path/to/alt.rom
      * The `romfile` property is registered on the base PCIDevice class
-     * (see DEFINE_PROP_STRING("romfile", ...) in hw/pci/pci.c), and the PCI
-     * core loads it via qemu_find_file(QEMU_FILE_TYPE_BIOS, ...) at realize.
+     * (see DEFINE_PROP_STRING("romfile", ...) in hw/pci/pci.c), and the
+     * PCI core loads it via qemu_find_file(QEMU_FILE_TYPE_BIOS, ...) at
+     * realize. See the pc-bios/apple-gfx-pci.rom patch for the status
+     * note on the in-tree EDK2 replacement.
      */
     pci->romfile = PG_PCI_DEFAULT_ROMFILE;
 

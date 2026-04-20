@@ -21,7 +21,12 @@ The PCI IDs match Apple's ParavirtualizedGraphics device
 `apple_gfx_pci_unrealize` tears down the display, device,
 surface, and cursor in that order.
 
+The option ROM is loaded via the base `PCIDeviceClass::romfile`
+mechanism set to `apple-gfx-pci.rom` (shipped via the companion
+pc-bios patch in this series). Users can override at the CLI
+with `-device apple-gfx-pci,romfile=/path/to/alt.rom`.
+
 Signed-off-by: Matthew Jackson <matthew@pq.io>
 ---
- hw/display/apple-gfx-pci-linux.c | ~180 insertions(+)
- 1 file changed, ~180 insertions(+)
+ hw/display/apple-gfx-pci-linux.c | ~200 insertions(+)
+ 1 file changed, ~200 insertions(+)
