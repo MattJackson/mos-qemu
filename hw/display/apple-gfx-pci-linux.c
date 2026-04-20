@@ -10,10 +10,20 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
 #include "apple-gfx-linux.h"
 #include "trace.h"
+
+/*
+ * Upper bound on the `gpu_cores` property. Leaves headroom above Mesa
+ * lavapipe's historical compile-time cap (LP_MAX_THREADS = 32) while
+ * staying in sensible host territory; values above this clamp silently
+ * to LAGFX_GPU_CORES_MAX with a warning. See
+ * paravirt-re/gpu-cores-implementation-spec.md §1, §7.
+ */
+#define LAGFX_GPU_CORES_MAX 64u
 
 /* PCI device identification */
 #define PG_PCI_VENDOR_ID 0x106b  /* Apple Inc. */
@@ -97,6 +107,23 @@ apple_gfx_pci_realize(PCIDevice *pci_dev, Error **errp)
     /* No pre-existing Vulkan instance */
     device_desc.shell_vulkan_instance = NULL;
 
+    /*
+     * Plumb `gpu_cores` -> descriptor thread_count -> LP_NUM_THREADS.
+     *
+     * Clamp >64 with a warning. 0 is the "unset; lavapipe default"
+     * sentinel and passes straight through. No hard error on
+     * over-range; operators may set high values intentionally (host
+     * CPU count, cgroup limit). See
+     * paravirt-re/gpu-cores-implementation-spec.md §7.
+     */
+    if (common->gpu_cores > LAGFX_GPU_CORES_MAX) {
+        warn_report("apple-gfx-pci: gpu_cores=%u exceeds max %u; "
+                    "clamping (lavapipe may clamp further)",
+                    common->gpu_cores, LAGFX_GPU_CORES_MAX);
+        common->gpu_cores = LAGFX_GPU_CORES_MAX;
+    }
+    device_desc.thread_count = common->gpu_cores;
+
     /* Initialize common device state */
     if (!apple_gfx_common_realize(common, DEVICE(pci_dev), &device_desc, errp)) {
         return;
@@ -153,6 +180,15 @@ static const Property apple_gfx_pci_properties[] = {
     DEFINE_PROP_ARRAY("display-modes", AppleGFXPCIState,
                       common.num_display_modes, common.display_modes,
                       qdev_prop_apple_gfx_display_mode, AppleGFXDisplayMode),
+    /*
+     * Per-VM lavapipe worker-thread budget. 0 = let lavapipe pick its
+     * default (host core count); N > 0 sets LP_NUM_THREADS=N before
+     * Vulkan init. Accepted values 0..LAGFX_GPU_CORES_MAX; higher
+     * values are clamped at realize with a warning. Reset-only
+     * (LP_NUM_THREADS is read by Mesa once, at Vulkan-ICD init).
+     * See paravirt-re/gpu-cores-implementation-spec.md.
+     */
+    DEFINE_PROP_UINT32("gpu_cores", AppleGFXPCIState, common.gpu_cores, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 

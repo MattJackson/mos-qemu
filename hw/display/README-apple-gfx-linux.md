@@ -1,5 +1,21 @@
 # Apple ParavirtualizedGraphics Linux Port — Phase 1.A
 
+## Device properties (`-device apple-gfx-pci,KEY=VAL,...`)
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `romfile` | string | `apple-gfx-pci.rom` | Option ROM loaded into the device's ROM BAR. Inherited from `PCIDevice`. |
+| `display-modes` | array of `<W>x<H>@<R>` | `1920x1080@60`, `1440x1080@60`, `1280x1024@60` | Advertised display modes. Repeatable, e.g. `display-modes.0=3840x2160@60`. |
+| `gpu_cores` | uint32 | `0` | Lavapipe worker-thread budget. `0` = let lavapipe pick its default (host core count); `N` sets `LP_NUM_THREADS=N` before Vulkan init. Accepted range `0..64` (higher values are clamped with a warning). Reset-only — Mesa reads `LP_NUM_THREADS` once at ICD init, so mid-VM changes have no effect; requires VM restart. See `paravirt-re/gpu-cores-implementation-spec.md`. |
+
+Example:
+
+```
+-device apple-gfx-pci,gpu_cores=8
+-device apple-gfx-pci,gpu_cores=16,display-modes.0=3840x2160@60
+-device apple-gfx-pci                  # unset -> lavapipe default
+```
+
 ## Overview
 
 This directory contains the Linux C port of QEMU's upstream `apple-gfx-pci.m` (157 lines) and `apple-gfx.m` (880 lines). The port targets Linux hosts and replaces the macOS-only Apple ParavirtualizedGraphics framework with libapplegfx-vulkan.
