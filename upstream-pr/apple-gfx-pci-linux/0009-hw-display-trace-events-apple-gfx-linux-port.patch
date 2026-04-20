@@ -1,0 +1,92 @@
+From: Matthew Jackson <matthew@pq.io>
+Subject: [PATCH 9/9] hw/display: trace-events entries for apple-gfx Linux port
+
+Add trace points for the Linux-C port's device lifecycle,
+task/memory plumbing, display callbacks, cursor callbacks, and
+MMIO dispatch. The trace points are all consumed by
+`apple-gfx-pci-linux.c` and `apple-gfx-common-linux.c` via
+`trace_apple_gfx_*()` calls introduced in patches 1-5 of this
+series.
+
+The Linux-port block supersedes upstream's narrower
+`apple-gfx.m` block (introduced with Phil Dennis-Jordan's
+macOS port) with wider argument types - e.g. `apple_gfx_create_task`
+takes `uint64_t vm_size` here to carry the full precision that
+`libapplegfx-vulkan`'s shell-callback ABI passes, where the
+Darwin port's 32-bit field was sufficient for Apple's framework.
+
+Because `apple-gfx.m`, `apple-gfx-pci.m`, and `apple-gfx-mmio.m`
+are gated at meson level on the `pvg` dependency (an
+`appleframeworks` module, macOS hosts only) and are therefore
+never compiled on a Linux host, there is no binary-level
+collision: only one definition of each trace point reaches
+the linker. The upstream `apple-gfx-mmio.m` block is retained
+unchanged for cross-builds of this source tree on macOS.
+
+The two PCI-specific trace points (`apple_gfx_pci_realize`,
+`apple_gfx_pci_reset`) replace the stop-gap
+`qemu_log_mask(LOG_TRACE, ...)` calls that were previously
+used because upstream had no matching definitions. With this
+patch applied, `apple-gfx-pci-linux.c` can call them via the
+normal `trace_*()` indirection.
+
+Signed-off-by: Matthew Jackson <matthew@pq.io>
+---
+ hw/display/trace-events | ~25 insertions(+), ~18 replaced(-)
+ 1 file changed, ~43 lines touched
+
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -195,24 +195,32 @@ dm163_leds(int led, uint32_t value) "led %d: 0x%x"
+ dm163_channels(int channel, uint8_t value) "channel %d: 0x%x"
+ dm163_refresh_rate(uint32_t rr) "refresh rate %d"
+
+-# apple-gfx.m
+-apple_gfx_read(uint64_t offset, uint64_t res) "offset=0x%"PRIx64" res=0x%"PRIx64
+-apple_gfx_write(uint64_t offset, uint64_t val) "offset=0x%"PRIx64" val=0x%"PRIx64
+-apple_gfx_create_task(uint32_t vm_size, void *va) "vm_size=0x%x base_addr=%p"
+-apple_gfx_destroy_task(void *task, unsigned int num_mapped_regions) "task=%p, task->mapped_regions->len=%u"
+-apple_gfx_map_memory(void *task, uint32_t range_count, uint64_t virtual_offset, uint32_t read_only) "task=%p range_count=0x%x virtual_offset=0x%"PRIx64" read_only=%d"
+-apple_gfx_map_memory_range(uint32_t i, uint64_t phys_addr, uint64_t phys_len) "[%d] phys_addr=0x%"PRIx64" phys_len=0x%"PRIx64
+-apple_gfx_remap(uint64_t retval, void *source_ptr, uint64_t target) "retval=%"PRId64" source=%p target=0x%"PRIx64
+-apple_gfx_unmap_memory(void *task, uint64_t virtual_offset, uint64_t length) "task=%p virtual_offset=0x%"PRIx64" length=0x%"PRIx64
+-apple_gfx_read_memory(uint64_t phys_address, uint64_t length, void *dst) "phys_addr=0x%"PRIx64" length=0x%"PRIx64" dest=%p"
+-apple_gfx_raise_irq(uint32_t vector) "vector=0x%x"
+-apple_gfx_new_frame(void) ""
+-apple_gfx_mode_change(uint64_t x, uint64_t y) "x=%"PRId64" y=%"PRId64
+-apple_gfx_cursor_set(uint32_t bpp, uint64_t width, uint64_t height) "bpp=%d width=%"PRId64" height=0x%"PRId64
+-apple_gfx_cursor_show(uint32_t show) "show=%d"
+-apple_gfx_cursor_move(void) ""
+-apple_gfx_common_init(const char *device_name, size_t mmio_size) "device: %s; MMIO size: %zu bytes"
+-apple_gfx_common_realize_modes_property(uint32_t num_modes) "using %u modes supplied by 'display-modes' device property"
+-apple_gfx_display_mode(uint32_t mode_idx, uint16_t width_px, uint16_t height_px) "mode %2"PRIu32": %4"PRIu16"x%4"PRIu16
++# apple-gfx-pci (Linux port) — see hw/display/apple-gfx-pci-linux.c,
++# hw/display/apple-gfx-common-linux.c. These supersede the upstream
++# apple-gfx.m block (wider types, explicit PCI realize/reset trace
++# points). apple-gfx.m / apple-gfx-mmio.m are gated on the `pvg`
++# dep (macOS only) and are not compiled on Linux, so no binary
++# collision occurs.
++apple_gfx_pci_realize(void) "apple-gfx-pci: device realize"
++apple_gfx_pci_reset(void) "apple-gfx-pci: device reset"
++apple_gfx_pci_init(const char *name, size_t mmio_size) "%s mmio_size=0x%zx"
++apple_gfx_create_task(uint64_t vm_size, void *va) "vm_size=0x%" PRIx64 " va=%p"
++apple_gfx_destroy_task(void *task, uint32_t n_regions) "task=%p regions=%u"
++apple_gfx_map_memory(void *task, size_t count, uint64_t virtual_offset, bool ro) "task=%p count=%zu offset=0x%" PRIx64 " ro=%d"
++apple_gfx_map_memory_range(size_t i, uint64_t gpa, uint64_t length) "range[%zu] gpa=0x%" PRIx64 " length=0x%" PRIx64
++apple_gfx_unmap_memory(void *task, uint64_t offset, uint64_t length) "task=%p offset=0x%" PRIx64 " length=0x%" PRIx64
++apple_gfx_read_memory(uint64_t gpa, uint64_t length, void *dst) "gpa=0x%" PRIx64 " length=0x%" PRIx64 " dst=%p"
++apple_gfx_raise_irq(uint32_t vector) "vector=%u"
++apple_gfx_new_frame(void) "new_frame"
++apple_gfx_mode_change(uint32_t width, uint32_t height) "width=%u height=%u"
++apple_gfx_cursor_set(uint32_t bits_per_pixel, uint32_t width, uint32_t height) "bpp=%u %ux%u"
++apple_gfx_cursor_show(bool show) "show=%d"
++apple_gfx_cursor_move(void) "cursor_move"
++apple_gfx_read(hwaddr offset, uint32_t value) "offset=0x%" HWADDR_PRIx " value=0x%x"
++apple_gfx_write(hwaddr offset, uint64_t val) "offset=0x%" HWADDR_PRIx " val=0x%" PRIx64
++apple_gfx_common_init(const char *name, size_t mmio_size) "%s mmio_size=0x%zx"
+
+ # apple-gfx-mmio.m
+ apple_gfx_mmio_iosfc_read(uint64_t offset, uint64_t res) "offset=0x%"PRIx64" res=0x%"PRIx64
+--
+2.47.0
+

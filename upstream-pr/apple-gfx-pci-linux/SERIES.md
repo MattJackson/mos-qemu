@@ -29,6 +29,7 @@ the existing Objective-C implementation:
 | `hw/display/apple-gfx-linux.h`       | **new (Linux port)** |
 | `hw/display/meson.build`             | **modified** (build gate) |
 | `hw/display/Kconfig`                 | **modified** (new symbol) |
+| `hw/display/trace-events`            | **modified** (Linux-port trace points) |
 | `pc-bios/meson.build`                | **modified** (ship ROM) |
 | `pc-bios/apple-gfx-pci.rom`          | **new blob** |
 
@@ -36,14 +37,15 @@ the existing Objective-C implementation:
 
 | Patch | Subject |
 |-------|---------|
-| 1/8   | `hw/display: add apple-gfx-pci-linux port skeleton` |
-| 2/8   | `hw/display/apple-gfx-linux: memory/task plumbing` |
-| 3/8   | `hw/display/apple-gfx-linux: MMIO dispatch` |
-| 4/8   | `hw/display/apple-gfx-linux: display callbacks and console integration` |
-| 5/8   | `hw/display/apple-gfx-linux: PCI device wrapper` |
-| 6/8   | `hw/display/apple-gfx-linux: add gpu_cores property` |
-| 7/8   | `hw/display/apple-gfx-linux: meson + Kconfig wiring` |
-| 8/8   | `pc-bios: ship apple-gfx-pci option ROM` |
+| 1/9   | `hw/display: add apple-gfx-pci-linux port skeleton` |
+| 2/9   | `hw/display/apple-gfx-linux: memory/task plumbing` |
+| 3/9   | `hw/display/apple-gfx-linux: MMIO dispatch` |
+| 4/9   | `hw/display/apple-gfx-linux: display callbacks and console integration` |
+| 5/9   | `hw/display/apple-gfx-linux: PCI device wrapper` |
+| 6/9   | `hw/display/apple-gfx-linux: add gpu_cores property` |
+| 7/9   | `hw/display/apple-gfx-linux: meson + Kconfig wiring` |
+| 8/9   | `pc-bios: ship apple-gfx-pci option ROM` |
+| 9/9   | `hw/display: trace-events entries for apple-gfx Linux port` |
 
 ## Library-side progress (as of this draft)
 
