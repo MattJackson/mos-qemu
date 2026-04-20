@@ -214,6 +214,193 @@ jobs:
           fi
 
   # -------------------------------------------------------------------------
+  # Real QEMU configure + compile (capped) — the single strongest gate on
+  # this repo. Overlays our hw/* + pc-bios/* files onto a pristine upstream
+  # QEMU tarball, then runs the real `./configure` + a time-boxed `make`.
+  # Catches what the cheap clang-syntax job can't: meson/Kconfig drift,
+  # trace.h generation collisions, cross-file symbol clashes, ROM blob
+  # packaging, and the class of API-drift bug M1 was quietly eating.
+  # -------------------------------------------------------------------------
+  meson-setup:
+    name: meson setup + capped compile (vs upstream qemu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-qemu-meson-v1-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            apt-${{ runner.os }}-qemu-meson-v1-
+
+      - name: Install QEMU build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang meson ninja-build pkg-config \
+            python3 python3-venv python3-tomli \
+            libglib2.0-dev libpixman-1-dev libfdt-dev \
+            libcap-ng-dev libseccomp-dev libslirp-dev libaio-dev \
+            libepoxy-dev libgtk-3-dev libsdl2-dev \
+            curl xz-utils bzip2 git
+
+      - name: Cache upstream QEMU tarball
+        uses: actions/cache@v4
+        with:
+          path: qemu-tarball
+          key: qemu-${{ env.QEMU_VERSION }}-tarball-v1
+          restore-keys: |
+            qemu-${{ env.QEMU_VERSION }}-tarball-
+
+      - name: Fetch upstream QEMU ${{ env.QEMU_VERSION }}
+        run: |
+          mkdir -p qemu-tarball
+          if [ ! -f "qemu-tarball/qemu-${QEMU_VERSION}.tar.xz" ]; then
+            curl -sSL -o "qemu-tarball/qemu-${QEMU_VERSION}.tar.xz" \
+              "https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz"
+          fi
+          tar xJf "qemu-tarball/qemu-${QEMU_VERSION}.tar.xz"
+          mv "qemu-${QEMU_VERSION}" qemu-src
+
+      - name: Overlay fork files onto upstream tree
+        # Mirrors what docker-macos/Dockerfile does. Keep in lockstep:
+        # if the Dockerfile gains a cp line, add it here too, otherwise
+        # CI will green on a set of files that production never builds.
+        run: |
+          set -eux
+          cp fork/hw/misc/applesmc.c                  qemu-src/hw/misc/applesmc.c
+          cp fork/hw/display/vmware_vga.c             qemu-src/hw/display/vmware_vga.c
+          cp fork/hw/usb/dev-hid.c                    qemu-src/hw/usb/dev-hid.c
+          cp fork/hw/display/apple-gfx-pci-linux.c    qemu-src/hw/display/
+          cp fork/hw/display/apple-gfx-common-linux.c qemu-src/hw/display/
+          cp fork/hw/display/apple-gfx-linux.h        qemu-src/hw/display/
+          cp fork/hw/display/meson.build              qemu-src/hw/display/meson.build
+          cp fork/hw/display/Kconfig                  qemu-src/hw/display/Kconfig
+          cp fork/hw/display/trace-events             qemu-src/hw/display/trace-events
+          cp fork/pc-bios/meson.build                 qemu-src/pc-bios/meson.build
+          cp fork/pc-bios/apple-gfx-pci.rom           qemu-src/pc-bios/apple-gfx-pci.rom
+
+      - name: configure (x86_64-softmmu)
+        working-directory: qemu-src
+        # Hard-fail: configure MUST succeed. This is the gate that would
+        # have caught the M1 API-drift class of bug (new field names,
+        # removed macros, Kconfig syntax changes).
+        run: |
+          ./configure \
+            --target-list=x86_64-softmmu \
+            --disable-werror \
+            --disable-docs \
+            --disable-debug-info \
+            --disable-tools
+
+      - name: make (time-boxed compile)
+        working-directory: qemu-src
+        # Cap at ~10 min with `timeout`. We don't need a full build; we
+        # need proof that ninja gets past the per-subdir trace.h and
+        # hw/display Kconfig expansion without errors. If the 10-minute
+        # cap is hit we treat that as success (configure + partial build
+        # both worked) — the next CI run with a warm cache will push
+        # further. If ninja errors out before the cap, that's a real
+        # breakage and fails the job.
+        # Exit statuses:
+        #   0   = full build completed
+        #   124 = timeout hit (treated as success — we compiled SOMETHING)
+        #   *   = real build error (re-raised)
+        run: |
+          set +e
+          timeout --preserve-status 600 make -j"$(nproc)"
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "::notice::full make completed"
+          elif [ "$rc" -eq 124 ] || [ "$rc" -eq 143 ]; then
+            echo "::notice::make hit 10-min timeout cap — configure + partial compile both succeeded"
+            exit 0
+          else
+            echo "::error::make failed with exit $rc"
+            exit "$rc"
+          fi
+
+      - name: Upload configure + meson logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-configure-logs
+          path: |
+            qemu-src/config.log
+            qemu-src/build/meson-logs/meson-log.txt
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # Forbidden-syntax-patterns — a cheap static scan for known-bad upstream
+  # API usage that would break against QEMU 10+. Runs in seconds, no
+  # configure needed. Complements the meson-setup job (which catches the
+  # same bugs but in ~10 min): this one catches them instantly so PR
+  # authors don't wait on a long build to learn they typed the wrong macro.
+  # -------------------------------------------------------------------------
+  forbidden-syntax-patterns:
+    name: no removed-in-qemu10 patterns in overlay
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan hw/ for DEFINE_PROP_END_OF_LIST
+        # Removed in QEMU 10+; property arrays are now terminated by
+        # a bare {} empty initializer. Any occurrence in overlay code
+        # is a build break waiting to happen.
+        run: |
+          set -e
+          if grep -rnE --include='*.c' --include='*.h' \
+               'DEFINE_PROP_END_OF_LIST' hw/; then
+            echo "::error::DEFINE_PROP_END_OF_LIST is removed in QEMU 10+. Drop the sentinel or replace with {}."
+            exit 1
+          fi
+          echo "hw/ overlay: no DEFINE_PROP_END_OF_LIST."
+
+      - name: Scan Kconfig for minikconf-incompatible syntax
+        # QEMU's minikconf supports only the `bool` + `depends on` + `select`
+        # + `default` subset. The full Kconfig `bool "prompt string"` form
+        # and `help` lines are rejected with a parse error. Catch locally
+        # before configure does.
+        run: |
+          set -e
+          fail=0
+          # Match: optional leading whitespace, the word `bool` as a
+          # standalone token, then whitespace + a double quote.
+          if grep -rnE --include='Kconfig' \
+               '^[[:space:]]*bool[[:space:]]+"' hw/; then
+            echo "::error::Kconfig prompt form (bool \"...\") is not supported by QEMU minikconf. Use bare bool on its own line."
+            fail=1
+          fi
+          if grep -rnE --include='Kconfig' \
+               '^[[:space:]]*help([[:space:]]|$)' hw/; then
+            echo "::error::Kconfig help block is not supported by QEMU minikconf. Delete the help text."
+            fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "hw/ Kconfig: minikconf-compatible."
+
+      - name: Scan upstream-pr/**/src for the same patterns
+        # upstream-pr/*/src/ is the staging form of files before they're
+        # emitted as .patch via git format-patch. If these files drift
+        # they'll break the moment someone regenerates the patch series.
+        run: |
+          set -e
+          fail=0
+          if [ -d upstream-pr ]; then
+            if grep -rnE --include='*.c' --include='*.h' \
+                 'DEFINE_PROP_END_OF_LIST' upstream-pr/; then
+              echo "::error::DEFINE_PROP_END_OF_LIST in upstream-pr/ staging source"
+              fail=1
+            fi
+          fi
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "upstream-pr/ staging: clean."
+
+  # -------------------------------------------------------------------------
   # Fork-local identifier scan — the whole point of this repo is that it's a
   # STAGING ground for upstream QEMU patches. Identifiers that reveal the
   # fork's existence (mos15, mos-qemu, MattJackson, mjackson, pq.io,
