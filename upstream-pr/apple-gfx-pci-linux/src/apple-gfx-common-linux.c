@@ -332,27 +332,132 @@ apple_gfx_raise_interrupt(void *opaque, uint32_t vector)
 
 /* ------ Display Callbacks ------ */
 
+/*
+ * Frame-ready bottom half: pull the most recent rendered frame out of
+ * libapplegfx-vulkan and push it into QEMU's DisplaySurface.
+ *
+ * Runs under the BQL because DisplaySurface mutation / dpy_gfx_update
+ * is not safe to call from arbitrary BH contexts on its own. The
+ * pending_frames counter is incremented by apple_gfx_frame_ready()
+ * (which libapplegfx calls from its render path) and drained here one
+ * at a time; if additional frames arrived while we were draining, we
+ * re-schedule ourselves so the display stays current without stalling
+ * the renderer.
+ *
+ * LAGFX_ERR_NO_FRAME is the expected return while the library's
+ * Vulkan render path is still in progress: treat it as a silent no-op
+ * and drop the frame token — the next frame_ready callback will
+ * re-arm us. Any other non-OK status is logged at LOG_GUEST_ERROR
+ * since it points at a real library or shell bug.
+ *
+ * This path is integration-tested via the first-pixel gate; there is
+ * no reasonable unit test because it requires a running QEMU with a
+ * live QemuConsole plus an initialised lagfx_display_t.
+ */
 static void
 apple_gfx_frame_ready_bh(void *opaque)
 {
     AppleGFXLinuxState *s = opaque;
+    void *dst;
+    size_t stride;
+    size_t width_px;
+    size_t height_px;
+    size_t dst_size;
+    size_t stride_out = 0;
+    bool new_frame = false;
+    lagfx_status_t r;
 
-    /* Drop frames if guest gets too far ahead */
-    if (s->pending_frames >= 2) {
+    BQL_LOCK_GUARD();
+
+    /*
+     * Surface not yet created (pre-mode_changed) or library not up:
+     * drop this token silently and wait for the next frame_ready.
+     */
+    if (qatomic_read(&s->pending_frames) <= 0 ||
+        !s->surface || !s->lagfx_disp) {
+        if (qatomic_read(&s->pending_frames) > 0) {
+            qatomic_fetch_sub(&s->pending_frames, 1);
+        }
         return;
     }
-    ++s->pending_frames;
-    if (s->pending_frames > 1) {
-        return;
+    qatomic_fetch_sub(&s->pending_frames, 1);
+
+    dst      = surface_data(s->surface);
+    stride   = surface_stride(s->surface);
+    width_px = surface_width(s->surface);
+    height_px = surface_height(s->surface);
+    dst_size = stride * height_px;
+
+    r = lagfx_display_read_frame(s->lagfx_disp, dst, dst_size,
+                                 &stride_out, &new_frame);
+
+    if (r == LAGFX_OK && new_frame) {
+        /*
+         * The library-reported stride should match DisplaySurface's
+         * stride; warn if they diverge. vkCmdCopyImageToBuffer to a
+         * linear BGRA8 buffer yields width*4 pitch, which matches
+         * QEMU's default DisplaySurface pitch on x86 hosts.
+         */
+        if (stride_out != 0 && stride_out != stride) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "apple-gfx: stride mismatch: surface=%zu "
+                          "library=%zu (frame may tear)\n",
+                          stride, stride_out);
+        }
+        qemu_log_mask(LOG_TRACE,
+                      "apple-gfx: frame dispatched to DisplaySurface "
+                      "(%zux%zu, stride=%zu)\n",
+                      width_px, height_px, stride);
+        dpy_gfx_update(s->con, 0, 0, (int)width_px, (int)height_px);
+    } else if (r == LAGFX_ERR_NO_FRAME) {
+        /*
+         * Library has no new frame yet; the Vulkan submit/readback
+         * pipeline will post one later via its own frame_ready
+         * callback. No-op — do not log, this is the hot path.
+         */
+    } else if (r != LAGFX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "apple-gfx: lagfx_display_read_frame failed "
+                      "(status=%d)\n", (int)r);
     }
 
-    /* TODO(Phase-1.B): Trigger Vulkan render + read-out via lagfx_display_read_frame */
+    /*
+     * More frames queued up while we were servicing this one — chain
+     * another BH so we don't leave the display stale. Guarded so we
+     * don't busy-loop if the library is stuck returning NO_FRAME.
+     */
+    if (qatomic_read(&s->pending_frames) > 0) {
+        aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                                apple_gfx_frame_ready_bh, opaque);
+    }
 }
 
 static void
 apple_gfx_frame_ready(void *opaque)
 {
+    AppleGFXLinuxState *s = opaque;
+    int prev;
+
     trace_apple_gfx_new_frame();
+
+    /*
+     * Drop frames if we're falling behind: cap pending_frames at 2 so
+     * a runaway renderer can't blow the BH queue. One BH is enough to
+     * drain; it will re-arm itself while work remains.
+     *
+     * This callback may run from a non-BQL library thread concurrently
+     * with the drain BH, so all access to pending_frames is via
+     * qatomic_* to match the BH's atomic read/sub.
+     */
+    if (qatomic_read(&s->pending_frames) >= 2) {
+        return;
+    }
+    prev = qatomic_fetch_add(&s->pending_frames, 1);
+    if (prev >= 1) {
+        /* Previous BH still in flight; it will chain to this frame. */
+        return;
+    }
+
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             apple_gfx_frame_ready_bh, opaque);
 }

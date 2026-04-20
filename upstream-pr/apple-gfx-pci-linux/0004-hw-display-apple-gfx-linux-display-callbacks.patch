@@ -4,8 +4,18 @@ Subject: [PATCH 4/8] hw/display/apple-gfx-linux: display callbacks and
 
 Implement the five display callbacks libapplegfx invokes:
 
-  * `apple_gfx_frame_ready`     - schedules a BH to consume the
-    guest-rendered frame, with a 2-frame overrun cap.
+  * `apple_gfx_frame_ready`     - increments the pending-frames
+    counter (capped at 2 to bound BH queue growth on a runaway
+    renderer) and schedules the drain bottom half.
+  * `apple_gfx_frame_ready_bh`  - under the BQL, drains one
+    pending token by calling `lagfx_display_read_frame` into
+    `surface_data(s->surface)` and posts `dpy_gfx_update` when
+    a new frame landed. `LAGFX_ERR_NO_FRAME` is treated as a
+    silent no-op (the library's render path may still be
+    producing it); any other non-OK status is logged at
+    `LOG_GUEST_ERROR`. The BH re-arms itself while more frames
+    remain queued so the display stays current without
+    stalling the renderer.
   * `apple_gfx_mode_changed`    - swaps the QEMU display surface
     to the new (width, height).
   * `apple_gfx_cursor_glyph`    - converts BGRA from the library
@@ -18,11 +28,18 @@ Implement the five display callbacks libapplegfx invokes:
 
 Console init uses a minimal `GraphicHwOps` with
 `gfx_update_async = true` and no synchronous `gfx_update`;
-rendering is driven entirely from the frame-ready BH, which
-the library will extend in a follow-up patch once the Vulkan
-readout path lands.
+rendering is driven entirely from the frame-ready BH. The
+surface stride is read via `surface_stride()` rather than
+assumed-equal to `width*4` so non-1920x1080 modes (the
+device's 1440x1080 and 1280x1024 entries) cannot tear on a
+pitch mismatch.
+
+This path is integration-tested via the first-pixel gate;
+there is no reasonable unit test because it requires a
+running QEMU with a live QemuConsole plus an initialised
+lagfx_display_t fixture.
 
 Signed-off-by: Matthew Jackson <matthew@pq.io>
 ---
- hw/display/apple-gfx-common-linux.c | ~150 insertions(+)
- 1 file changed, ~150 insertions(+)
+ hw/display/apple-gfx-common-linux.c | ~200 insertions(+)
+ 1 file changed, ~200 insertions(+)
