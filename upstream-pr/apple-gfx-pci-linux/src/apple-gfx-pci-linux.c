@@ -179,7 +179,6 @@ static const Property apple_gfx_pci_properties[] = {
      * (LP_NUM_THREADS is read by Mesa once, at Vulkan-ICD init).
      */
     DEFINE_PROP_UINT32("gpu_cores", AppleGFXPCIState, common.gpu_cores, 0),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static void
