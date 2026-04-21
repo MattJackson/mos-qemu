@@ -6,7 +6,7 @@ This document specifies how the Linux port of the Apple ParavirtualizedGraphics 
 
 ## Files in mos-qemu
 
-The following files in `/Users/mjackson/qemu-mos15/` are overlay/replacement files for QEMU 10.2.2:
+The following files in `/Users/mjackson/Developer/qemu-mos15/` are overlay/replacement files for QEMU 10.2.2:
 
 - `hw/display/apple-gfx-pci-linux.c` — Main device implementation
 - `hw/display/apple-gfx-common-linux.c` — Shared utilities
@@ -41,7 +41,7 @@ This follows the existing pattern for `applesmc.c`, `vmware_vga.c`, and `dev-hid
 
 ### meson.build changes
 
-In `/Users/mjackson/qemu-mos15/hw/display/meson.build`:
+In `/Users/mjackson/Developer/qemu-mos15/hw/display/meson.build`:
 
 ```meson
 # Apple ParavirtualizedGraphics PCI device (Linux C port).
@@ -65,7 +65,7 @@ libapplegfx-vulkan silently drops the device.
 
 ### Kconfig changes (8 lines added)
 
-Lines 154-161 in `/Users/mjackson/qemu-mos15/hw/display/Kconfig`:
+Lines 154-161 in `/Users/mjackson/Developer/qemu-mos15/hw/display/Kconfig`:
 
 ```kconfig
 config APPLE_GFX_PCI_LINUX
