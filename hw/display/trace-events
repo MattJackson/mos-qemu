@@ -225,6 +225,7 @@ apple_gfx_map_memory(void *task, size_t count, uint64_t virtual_offset, bool ro)
 apple_gfx_map_memory_range(size_t i, uint64_t gpa, uint64_t length) "range[%zu] gpa=0x%" PRIx64 " length=0x%" PRIx64
 apple_gfx_unmap_memory(void *task, uint64_t offset, uint64_t length) "task=%p offset=0x%" PRIx64 " length=0x%" PRIx64
 apple_gfx_read_memory(uint64_t gpa, uint64_t length, void *dst) "gpa=0x%" PRIx64 " length=0x%" PRIx64 " dst=%p"
+apple_gfx_write_memory(uint64_t gpa, uint64_t length, const void *src) "gpa=0x%" PRIx64 " length=0x%" PRIx64 " src=%p"
 apple_gfx_raise_irq(uint32_t vector) "vector=%u"
 apple_gfx_new_frame(void) "new_frame"
 apple_gfx_mode_change(uint32_t width, uint32_t height) "width=%u height=%u"

@@ -302,6 +302,22 @@ apple_gfx_read_memory(void *opaque, uint64_t guest_physical_address,
     return (r == MEMTX_OK);
 }
 
+bool
+apple_gfx_write_memory(void *opaque, uint64_t guest_physical_address,
+                       uint64_t length, const void *src)
+{
+    MemTxResult r;
+
+    (void)opaque;
+
+    trace_apple_gfx_write_memory(guest_physical_address, length, src);
+
+    r = dma_memory_write(&address_space_memory, guest_physical_address,
+                         src, length, MEMTXATTRS_UNSPECIFIED);
+
+    return (r == MEMTX_OK);
+}
+
 /* ------ Interrupt Injection ------ */
 
 typedef struct {

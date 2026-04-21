@@ -111,6 +111,7 @@ apple_gfx_pci_realize(PCIDevice *pci_dev, Error **errp)
     device_desc.shell.map_memory = apple_gfx_map_memory;
     device_desc.shell.unmap_memory = apple_gfx_unmap_memory;
     device_desc.shell.read_memory = apple_gfx_read_memory;
+    device_desc.shell.write_memory = apple_gfx_write_memory;
     device_desc.shell.raise_interrupt = apple_gfx_raise_interrupt;
 
     /* MMIO region size hint (0 = use library default) */
