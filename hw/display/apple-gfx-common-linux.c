@@ -285,8 +285,15 @@ bool
 apple_gfx_read_memory(void *opaque, uint64_t guest_physical_address,
                       uint64_t length, void *dst)
 {
-    AppleGFXLinuxState *s = opaque;
     MemTxResult r;
+
+    /*
+     * opaque holds the AppleGFXLinuxState but the DMA engine is
+     * addressed directly via address_space_memory, so the caller
+     * state is not needed here. Keep the argument for ABI
+     * symmetry with the other libapplegfx-vulkan callbacks.
+     */
+    (void)opaque;
 
     trace_apple_gfx_read_memory(guest_physical_address, length, dst);
 
