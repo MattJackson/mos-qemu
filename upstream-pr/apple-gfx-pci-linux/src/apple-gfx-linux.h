@@ -116,6 +116,8 @@ bool apple_gfx_unmap_memory(void *opaque, lagfx_task_t *task,
                             uint64_t virtual_offset, uint64_t length);
 bool apple_gfx_read_memory(void *opaque, uint64_t guest_physical_address,
                            uint64_t length, void *dst);
+bool apple_gfx_write_memory(void *opaque, uint64_t guest_physical_address,
+                            uint64_t length, const void *src);
 void apple_gfx_raise_interrupt(void *opaque, uint32_t vector);
 
 #endif /* QEMU_APPLE_GFX_LINUX_H */

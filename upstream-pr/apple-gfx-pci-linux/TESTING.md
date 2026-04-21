@@ -121,19 +121,30 @@ The option ROM is loaded automatically from
 First-boot kernel log should show the guest kext attaching:
 
 ```
-AppleParavirtGPU: IOPCIDevice attached (vendor 0x106b
-    device 0x1b30)
+AppleParavirtGPU: IOPCIDevice attached (vendor 0x106B
+    device 0xEEEE)
 AppleParavirtGPU: option ROM present
-AppleParavirtGPU: entering para-virt mode
+AppleParavirtGPUControl::start() entered
 ```
+
+(The Apple guest kext's Info.plist declares
+`IOPCIMatch = "0xEEEE106B"`, which IOKit encodes as
+`(device_id << 16) | vendor_id`. The device therefore
+presents `vendor_id=0x106B, device_id=0xEEEE`; the
+subsystem IDs are populated identically so both strict
+and subsystem-aware IOKit match modes resolve.)
 
 The QEMU host log (`-d trace:apple_gfx_*`) shows the
 expected sequence:
 
 ```
 apple_gfx_common_init apple-gfx-linux 16384
+apple_gfx_pci_realize apple-gfx-pci: device realize
 apple_gfx_create_task vm_size=... base=...
 apple_gfx_map_memory task=... count=... offset=...
+apple_gfx_read_memory gpa=... length=... dst=...
+apple_gfx_write_memory gpa=... length=... src=...
+apple_gfx_raise_irq vector=...
 apple_gfx_new_frame
 ```
 

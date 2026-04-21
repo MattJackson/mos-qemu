@@ -2,11 +2,12 @@ From: Matthew Jackson <matthew@pq.io>
 Subject: [PATCH 9/9] hw/display: trace-events entries for apple-gfx Linux port
 
 Add trace points for the Linux-C port's device lifecycle,
-task/memory plumbing, display callbacks, cursor callbacks, and
-MMIO dispatch. The trace points are all consumed by
-`apple-gfx-pci-linux.c` and `apple-gfx-common-linux.c` via
-`trace_apple_gfx_*()` calls introduced in patches 1-5 of this
-series.
+task/memory plumbing (including both `read_memory` and
+`write_memory` DMA forwarders), display callbacks, cursor
+callbacks, and MMIO dispatch. The trace points are all
+consumed by `apple-gfx-pci-linux.c` and
+`apple-gfx-common-linux.c` via `trace_apple_gfx_*()` calls
+introduced in patches 1-5 of this series.
 
 The Linux-port block supersedes upstream's narrower
 `apple-gfx.m` block (introduced with Phil Dennis-Jordan's
@@ -32,8 +33,8 @@ normal `trace_*()` indirection.
 
 Signed-off-by: Matthew Jackson <matthew@pq.io>
 ---
- hw/display/trace-events | ~25 insertions(+), ~18 replaced(-)
- 1 file changed, ~43 lines touched
+ hw/display/trace-events | ~26 insertions(+), ~18 replaced(-)
+ 1 file changed, ~44 lines touched
 
 --- a/hw/display/trace-events
 +++ b/hw/display/trace-events
@@ -75,6 +76,7 @@ Signed-off-by: Matthew Jackson <matthew@pq.io>
 +apple_gfx_map_memory_range(size_t i, uint64_t gpa, uint64_t length) "range[%zu] gpa=0x%" PRIx64 " length=0x%" PRIx64
 +apple_gfx_unmap_memory(void *task, uint64_t offset, uint64_t length) "task=%p offset=0x%" PRIx64 " length=0x%" PRIx64
 +apple_gfx_read_memory(uint64_t gpa, uint64_t length, void *dst) "gpa=0x%" PRIx64 " length=0x%" PRIx64 " dst=%p"
++apple_gfx_write_memory(uint64_t gpa, uint64_t length, const void *src) "gpa=0x%" PRIx64 " length=0x%" PRIx64 " src=%p"
 +apple_gfx_raise_irq(uint32_t vector) "vector=%u"
 +apple_gfx_new_frame(void) "new_frame"
 +apple_gfx_mode_change(uint32_t width, uint32_t height) "width=%u height=%u"

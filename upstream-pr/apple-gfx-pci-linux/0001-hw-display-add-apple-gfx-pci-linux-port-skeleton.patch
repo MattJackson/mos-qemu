@@ -1,5 +1,5 @@
 From: Matthew Jackson <matthew@pq.io>
-Subject: [PATCH 1/8] hw/display: add apple-gfx-pci-linux port skeleton
+Subject: [PATCH 1/9] hw/display: add apple-gfx-pci-linux port skeleton
 
 Introduce two new source files and one header that provide
 the scaffolding for a Linux C port of `hw/display/apple-gfx-pci.m`

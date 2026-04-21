@@ -1,7 +1,7 @@
 From: Matthew Jackson <matthew@pq.io>
-Subject: [PATCH 2/8] hw/display/apple-gfx-linux: memory/task plumbing
+Subject: [PATCH 2/9] hw/display/apple-gfx-linux: memory/task plumbing
 
-Implement the five shell callbacks for guest-memory tasks:
+Implement the six shell callbacks for guest-memory tasks:
 
   * `apple_gfx_create_task` - wraps `lagfx_task_create`
     (which performs the underlying `mmap(PROT_NONE)` range
@@ -23,6 +23,15 @@ Implement the five shell callbacks for guest-memory tasks:
     `lagfx_task_unmap`.
   * `apple_gfx_read_memory` - wraps `dma_memory_read` for
     small control-plane reads that don't justify a mapping.
+  * `apple_gfx_write_memory` - wraps `dma_memory_write`,
+    the symmetric counterpart for control-plane writebacks
+    (e.g. response descriptors posted to a guest-owned ring
+    after an MMIO command completes). Added to the
+    `lagfx_device_descriptor_t::shell` vtable alongside
+    `read_memory`; both forward directly to
+    `address_space_memory` so opaque state is unused (marked
+    with `(void)opaque` to silence -Wunused-parameter on
+    strict builds).
 
 Host-pointer translation is done under
 `RCU_READ_LOCK_GUARD()`; the task list is protected by its
@@ -35,5 +44,6 @@ rest of the batch is processed.
 
 Signed-off-by: Matthew Jackson <matthew@pq.io>
 ---
- hw/display/apple-gfx-common-linux.c | ~200 insertions(+)
- 1 file changed, ~200 insertions(+)
+ hw/display/apple-gfx-common-linux.c | ~220 insertions(+)
+ hw/display/apple-gfx-linux.h        |   2 insertions(+)
+ 2 files changed, ~222 insertions(+)

@@ -1,19 +1,42 @@
 From: Matthew Jackson <matthew@pq.io>
-Subject: [PATCH 5/8] hw/display/apple-gfx-linux: PCI device wrapper
+Subject: [PATCH 5/9] hw/display/apple-gfx-linux: PCI device wrapper
 
 Complete `apple-gfx-pci-linux.c` with the PCI realize path.
-The PCI IDs match Apple's ParavirtualizedGraphics device
-(vendor 0x106b, device 0x1b30), matching the existing
-`TYPE_APPLE_GFX_PCI` in the macOS sibling.
+
+PCI identity:
+
+  * `vendor_id = 0x106B` (Apple Inc.)
+  * `device_id = 0xEEEE`
+  * `subsystem_vendor_id = 0x106B`
+  * `subsystem_id = 0xEEEE`
+  * `class_id = PCI_CLASS_DISPLAY_VGA`
+
+The (vendor, device) pair matches what the macOS guest's
+`AppleParavirtGPU.kext` probes for: its Info.plist declares
+`IOPCIMatch = "0xEEEE106B"`, which IOKit encodes as
+`(device_id << 16) | vendor_id`. Attaching with the
+historical `0x1b30` device-id leaves the kext loaded but
+never `start()`-ing; with `0xEEEE` the guest kext's
+`AppleParavirtGPUControl::start()` path runs.
+Subsystem IDs are populated identically so both match modes
+(strict vendor/device and vendor/device/subsystem) resolve.
+`PCI_CLASS_DISPLAY_VGA` matches the upstream
+`apple-gfx-pci.m` sibling and lets the guest's UEFI firmware
+pick the device as the boot display.
 
 `apple_gfx_pci_realize`:
 
   * Registers BAR0 for MMIO (range allocated by
     `apple_gfx_common_init`).
-  * Sets up MSI-X for interrupt delivery
-    (`PG_PCI_MAX_MSI_VECTORS = 64`, matching the sibling).
+  * Sets up MSI for interrupt delivery
+    (`PG_PCI_MAX_MSI_VECTORS = 32`, matching Apple's guest
+    kext's published `#MSI` capability and the upstream
+    macOS sibling).
   * Populates the `lagfx_device_descriptor_t` shell with the
-    six callbacks from patches 2-3.
+    seven callbacks from patches 2-3
+    (`create_task`, `destroy_task`, `map_memory`,
+    `unmap_memory`, `read_memory`, `write_memory`,
+    `raise_interrupt`).
   * Delegates to `apple_gfx_common_realize` which calls
     `lagfx_device_new` / `lagfx_display_new`.
 
@@ -28,5 +51,5 @@ with `-device apple-gfx-pci,romfile=/path/to/alt.rom`.
 
 Signed-off-by: Matthew Jackson <matthew@pq.io>
 ---
- hw/display/apple-gfx-pci-linux.c | ~200 insertions(+)
- 1 file changed, ~200 insertions(+)
+ hw/display/apple-gfx-pci-linux.c | ~220 insertions(+)
+ 1 file changed, ~220 insertions(+)

@@ -21,13 +21,14 @@
 #include "system/dma.h"
 #include "migration/blocker.h"
 #include "ui/console.h"
+#include "hw/qdev-properties.h"
+#include "hw/pci/msi.h"
+#include "hw/pci/pci.h"
 #include "apple-gfx-linux.h"
 #include "trace.h"
 
 #define PG_PCI_BAR_MMIO 0
-#define PG_PCI_VENDOR_ID 0x106b  /* Apple Inc. */
-#define PG_PCI_DEVICE_ID 0x1b30  /* ParavirtualizedGraphics */
-#define PG_PCI_MAX_MSI_VECTORS 64
+#define PG_PCI_MAX_MSI_VECTORS 32
 
 static const AppleGFXDisplayMode apple_gfx_default_modes[] = {
     { 1920, 1080, 60 },
@@ -276,18 +277,51 @@ apple_gfx_unmap_memory(void *opaque, lagfx_task_t *task,
     return true;
 }
 
+/*
+ * Shell callback: read guest RAM into a library-supplied buffer.
+ *
+ * The library uses this for small control-plane reads (descriptors,
+ * ring-buffer heads) where a full map_memory would be overkill. We
+ * simply forward to QEMU's DMA engine. opaque holds the
+ * AppleGFXLinuxState but is unused here because the DMA engine is
+ * addressed directly via address_space_memory; we keep the argument
+ * for ABI symmetry with the other libapplegfx-vulkan callbacks.
+ */
 bool
 apple_gfx_read_memory(void *opaque, uint64_t guest_physical_address,
                       uint64_t length, void *dst)
 {
-    AppleGFXLinuxState *s = opaque;
     MemTxResult r;
+
+    (void)opaque;
 
     trace_apple_gfx_read_memory(guest_physical_address, length, dst);
 
-    /* Use QEMU's DMA engine to read guest RAM into dst */
     r = dma_memory_read(&address_space_memory, guest_physical_address,
                         dst, length, MEMTXATTRS_UNSPECIFIED);
+
+    return (r == MEMTX_OK);
+}
+
+/*
+ * Shell callback: write a library-supplied buffer into guest RAM.
+ *
+ * Symmetric to apple_gfx_read_memory; used by the library's
+ * control-plane writebacks (e.g. response descriptors written to a
+ * guest-owned ring after an MMIO command completes).
+ */
+bool
+apple_gfx_write_memory(void *opaque, uint64_t guest_physical_address,
+                       uint64_t length, const void *src)
+{
+    MemTxResult r;
+
+    (void)opaque;
+
+    trace_apple_gfx_write_memory(guest_physical_address, length, src);
+
+    r = dma_memory_write(&address_space_memory, guest_physical_address,
+                         src, length, MEMTXATTRS_UNSPECIFIED);
 
     return (r == MEMTX_OK);
 }

@@ -1,5 +1,5 @@
 From: Matthew Jackson <matthew@pq.io>
-Subject: [PATCH 4/8] hw/display/apple-gfx-linux: display callbacks and
+Subject: [PATCH 4/9] hw/display/apple-gfx-linux: display callbacks and
  console integration
 
 Implement the five display callbacks libapplegfx invokes,

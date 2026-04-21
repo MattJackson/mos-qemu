@@ -27,7 +27,7 @@ paravirt GPU they attach on macOS hosts.
   * `pc-bios/apple-gfx-pci.rom` (option ROM, development
     placeholder - see per-patch note)
 
-The series is 8 patches and adds a new device type
+The series is 9 patches and adds a new device type
 `apple-gfx-pci` on Linux hosts, with a `gpu_cores=N`
 property tunable for lavapipe's worker-pool cap. No
 upstream file is functionally modified. The build gate is

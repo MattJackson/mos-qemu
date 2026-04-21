@@ -1,5 +1,5 @@
 From: Matthew Jackson <matthew@pq.io>
-Subject: [PATCH 7/8] hw/display/apple-gfx-linux: meson + Kconfig wiring
+Subject: [PATCH 7/9] hw/display/apple-gfx-linux: meson + Kconfig wiring
 
 Add `CONFIG_APPLE_GFX_PCI_LINUX` to `hw/display/Kconfig` with
 `default y if PCI_DEVICES`, depending on PCI. Add the meson

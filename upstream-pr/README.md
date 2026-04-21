@@ -54,9 +54,9 @@ same PGDevice protocol via `libapplegfx-vulkan` (a Mesa
 lavapipe-backed shell reimplementation). Zero upstream
 files are modified; additive only.
 
-Eight patches total, adding the device, its `gpu_cores=N`
-tunable, the meson + Kconfig gate, and a placeholder option
-ROM blob in pc-bios.
+Nine patches total, adding the device, its `gpu_cores=N`
+tunable, the meson + Kconfig gate, a placeholder option
+ROM blob in pc-bios, and the Linux-port trace-events block.
 
 **Library-side state** (as of this revision):
 `libapplegfx-vulkan` at commit `8edc43c` implements Phase

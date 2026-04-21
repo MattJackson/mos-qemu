@@ -1,5 +1,5 @@
 From: Matthew Jackson <matthew@pq.io>
-Subject: [PATCH 6/8] hw/display/apple-gfx-linux: add gpu_cores property
+Subject: [PATCH 6/9] hw/display/apple-gfx-linux: add gpu_cores property
 
 Expose a `gpu_cores=N` QEMU device property that caps the
 number of Mesa lavapipe worker threads the paravirt GPU uses.

@@ -1,5 +1,5 @@
 From: Matthew Jackson <matthew@pq.io>
-Subject: [PATCH 3/8] hw/display/apple-gfx-linux: MMIO dispatch
+Subject: [PATCH 3/9] hw/display/apple-gfx-linux: MMIO dispatch
 
 Wire the PCI BAR0 MMIO region to `lagfx_mmio_read` /
 `lagfx_mmio_write` in libapplegfx-vulkan. The library is the
@@ -22,9 +22,13 @@ so new opcodes introduced upstream in the library require
 no QEMU change.
 
 Trace events `apple_gfx_read` / `apple_gfx_write` are
-already defined by the upstream apple-gfx.m sibling (shared
-`hw/display/trace-events`). The Linux port reuses those
-without adding new entries.
+added by the companion trace-events patch (9/9) in a
+dedicated Linux-port block — the Linux-port block supersedes
+upstream's narrower `apple-gfx.m` definitions with wider
+argument types (hwaddr/uint32 vs the Darwin-port's 32-bit
+fields). Because `apple-gfx.m` is gated on the `pvg`
+appleframeworks dep (macOS hosts only) and is not compiled
+on Linux, there is no linker collision.
 
 Signed-off-by: Matthew Jackson <matthew@pq.io>
 ---

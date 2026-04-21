@@ -1,5 +1,5 @@
 From: Matthew Jackson <matthew@pq.io>
-Subject: [PATCH 8/8] pc-bios: ship apple-gfx-pci option ROM
+Subject: [PATCH 8/9] pc-bios: ship apple-gfx-pci option ROM
 
 The Apple ParavirtualizedGraphics PCI device loads an option
 ROM from the host that the guest's UEFI firmware uses to
