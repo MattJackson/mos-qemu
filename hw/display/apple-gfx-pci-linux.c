@@ -25,9 +25,18 @@
  */
 #define LAGFX_GPU_CORES_MAX 64u
 
-/* PCI device identification */
-#define PG_PCI_VENDOR_ID 0x106b  /* Apple Inc. */
-#define PG_PCI_DEVICE_ID 0x1b30  /* ParavirtualizedGraphics */
+/*
+ * PCI device identification.
+ *
+ * x86_64 macOS Sequoia AppleParavirtGPU.kext matches on
+ * IOPCIMatch = 0xEEEE106B — vendor 0xEEEE / device 0x106B. The
+ * Apple-Silicon VMApple device ID (0x1B30) is NOT a match key on
+ * the x86 kext. Advertising the wrong pair is a silent no-op: the
+ * PCI device appears on bus but no driver binds. Confirmed via
+ * paravirt-re/kext-inventory.md + baselines/phase-1d-attach.txt.
+ */
+#define PG_PCI_VENDOR_ID 0xEEEE
+#define PG_PCI_DEVICE_ID 0x106B
 #define PG_PCI_MAX_MSI_VECTORS 32
 #define PG_PCI_BAR_MMIO 0
 
