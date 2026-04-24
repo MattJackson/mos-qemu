@@ -1,0 +1,9 @@
+# Private working notes — live in private gitea (pq/mos)
+.claude/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
