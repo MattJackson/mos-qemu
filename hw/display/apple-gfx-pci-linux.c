@@ -11,7 +11,7 @@
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
 #include "hw/pci/pci_device.h"
-#include "hw/pci/msix.h"
+#include "hw/pci/msi.h"
 #include "hw/qdev-properties.h"
 #include "apple-gfx-linux.h"
 #include "trace.h"
@@ -89,19 +89,17 @@ apple_gfx_pci_realize(PCIDevice *pci_dev, Error **errp)
     lagfx_device_descriptor_t device_desc;
     int ret;
 
-    /* MSI-X table (512 B) and PBA (8 B) in BAR0 at high offsets,
-     * above MMIO register space (0x0000-0x1FFF) */
-    ret = msix_init(pci_dev, PG_PCI_MAX_MSI_VECTORS,
-                    &common->iomem_gfx, PG_PCI_BAR_MMIO, 0x3800,
-                    &common->iomem_gfx, PG_PCI_BAR_MMIO, 0x3C00,
-                    0x0 /* auto */, errp);
+    /* Register MMIO BAR */
+    pci_register_bar(pci_dev, PG_PCI_BAR_MMIO,
+                     PCI_BASE_ADDRESS_SPACE_MEMORY, &common->iomem_gfx);
+
+    /* Initialize MSI-X for interrupt delivery */
+    ret = msi_init(pci_dev, 0x0 /* config offset; 0 = auto */,
+                   PG_PCI_MAX_MSI_VECTORS, true /* msi64bit */,
+                   false /* msi_per_vector_mask */, errp);
     if (ret != 0) {
         return;
     }
-
-    /* Register MMIO BAR (16 KiB, includes MSI-X table+PBA at top) */
-    pci_register_bar(pci_dev, PG_PCI_BAR_MMIO,
-                     PCI_BASE_ADDRESS_SPACE_MEMORY, &common->iomem_gfx);
 
     /* Prepare device descriptor for libapplegfx */
     memset(&device_desc, 0, sizeof(device_desc));

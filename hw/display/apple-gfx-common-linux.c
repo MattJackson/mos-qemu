@@ -22,7 +22,7 @@
 #include "migration/blocker.h"
 #include "ui/console.h"
 #include "hw/qdev-properties.h"
-#include "hw/pci/msix.h"
+#include "hw/pci/msi.h"
 #include "hw/pci/pci.h"
 #include "apple-gfx-linux.h"
 #include "trace.h"
@@ -330,8 +330,8 @@ apple_gfx_raise_interrupt_bh(void *opaque)
 {
     AppleGFXInterruptJob *job = opaque;
 
-    if (msix_enabled(job->device)) {
-        msix_notify(job->device, job->vector);
+    if (msi_enabled(job->device)) {
+        msi_notify(job->device, job->vector);
     }
     g_free(job);
 }
@@ -643,9 +643,8 @@ static const MemoryRegionOps apple_gfx_mmio_ops = {
 void
 apple_gfx_common_init(Object *obj, AppleGFXLinuxState *s)
 {
-    /* 16 KiB BAR: MMIO registers (0x0000-0x1FFF) + MSI-X table at
-     * 0x3800 (512 B) and PBA at 0x3C00 (8 B) — all within 16 KiB BAR */
-    size_t mmio_range_size = 0x4000;
+    /* Default MMIO region size; libapplegfx may override */
+    size_t mmio_range_size = 0x4000;  /* 16 KB default */
 
     trace_apple_gfx_common_init("apple-gfx-linux", mmio_range_size);
 
