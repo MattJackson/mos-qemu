@@ -22,7 +22,7 @@
 #include "migration/blocker.h"
 #include "ui/console.h"
 #include "hw/qdev-properties.h"
-#include "hw/pci/msi.h"
+#include "hw/pci/msix.h"
 #include "hw/pci/pci.h"
 #include "apple-gfx-linux.h"
 #include "trace.h"
@@ -330,8 +330,8 @@ apple_gfx_raise_interrupt_bh(void *opaque)
 {
     AppleGFXInterruptJob *job = opaque;
 
-    if (msi_enabled(job->device)) {
-        msi_notify(job->device, job->vector);
+    if (msix_enabled(job->device)) {
+        msix_notify(job->device, job->vector);
     }
     g_free(job);
 }

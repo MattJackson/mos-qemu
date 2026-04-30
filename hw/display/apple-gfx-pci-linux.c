@@ -11,7 +11,7 @@
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
 #include "hw/pci/pci_device.h"
-#include "hw/pci/msi.h"
+#include "hw/pci/msix.h"
 #include "hw/qdev-properties.h"
 #include "apple-gfx-linux.h"
 #include "trace.h"
@@ -93,10 +93,9 @@ apple_gfx_pci_realize(PCIDevice *pci_dev, Error **errp)
     pci_register_bar(pci_dev, PG_PCI_BAR_MMIO,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &common->iomem_gfx);
 
-    /* Initialize MSI-X for interrupt delivery */
-    ret = msi_init(pci_dev, 0x0 /* config offset; 0 = auto */,
-                   PG_PCI_MAX_MSI_VECTORS, true /* msi64bit */,
-                   false /* msi_per_vector_mask */, errp);
+    /* Initialize MSI-X for interrupt delivery (dedicated BAR) */
+    ret = msix_init_exclusive_bar(pci_dev, PG_PCI_MAX_MSI_VECTORS,
+                                  1 /* BAR1 */, errp);
     if (ret != 0) {
         return;
     }
