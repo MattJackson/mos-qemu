@@ -643,9 +643,9 @@ static const MemoryRegionOps apple_gfx_mmio_ops = {
 void
 apple_gfx_common_init(Object *obj, AppleGFXLinuxState *s)
 {
-    /* MMIO region: 16 KiB registers + MSI-X table (0x200) + PBA (0x8)
-     * rounded to 32 KiB (0x8000) power-of-2 BAR size */
-    size_t mmio_range_size = 0x8000;
+    /* 16 KiB BAR: MMIO registers (0x0000-0x1FFF) + MSI-X table at
+     * 0x3800 (512 B) and PBA at 0x3C00 (8 B) — all within 16 KiB BAR */
+    size_t mmio_range_size = 0x4000;
 
     trace_apple_gfx_common_init("apple-gfx-linux", mmio_range_size);
 

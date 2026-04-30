@@ -89,16 +89,17 @@ apple_gfx_pci_realize(PCIDevice *pci_dev, Error **errp)
     lagfx_device_descriptor_t device_desc;
     int ret;
 
-    /* Initialize MSI-X in BAR0 (table at 0x4000, PBA at 0x5000) */
+    /* MSI-X table (512 B) and PBA (8 B) in BAR0 at high offsets,
+     * above MMIO register space (0x0000-0x1FFF) */
     ret = msix_init(pci_dev, PG_PCI_MAX_MSI_VECTORS,
-                    &common->iomem_gfx, PG_PCI_BAR_MMIO, 0x4000,
-                    &common->iomem_gfx, PG_PCI_BAR_MMIO, 0x5000,
+                    &common->iomem_gfx, PG_PCI_BAR_MMIO, 0x3800,
+                    &common->iomem_gfx, PG_PCI_BAR_MMIO, 0x3C00,
                     0x0 /* auto */, errp);
     if (ret != 0) {
         return;
     }
 
-    /* Register MMIO BAR (expanded to 0x8000 to include MSI-X table+PBA) */
+    /* Register MMIO BAR (16 KiB, includes MSI-X table+PBA at top) */
     pci_register_bar(pci_dev, PG_PCI_BAR_MMIO,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &common->iomem_gfx);
 
