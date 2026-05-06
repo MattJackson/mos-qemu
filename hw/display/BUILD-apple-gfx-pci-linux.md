@@ -47,7 +47,7 @@ In `/Users/mjackson/Developer/qemu-mos15/hw/display/meson.build`:
 # Apple ParavirtualizedGraphics PCI device (Linux C port).
 # Declared self-contained here so we do not need to overlay root meson.build.
 if config_all_devices.has_key('CONFIG_APPLE_GFX_PCI_LINUX')
-  libapplegfx_vulkan = dependency('libapplegfx-vulkan', required: false)
+  libapplegfx_vulkan = dependency('libapplegfx-vulkan', required: true)
   if libapplegfx_vulkan.found()
     applegfx_ss = ss.source_set()
     applegfx_ss.add(when: 'CONFIG_APPLE_GFX_PCI_LINUX', if_true: [
@@ -60,8 +60,8 @@ endif
 ```
 
 The dependency is declared inline rather than at root `meson.build` so we
-avoid overlaying a huge upstream file. `required: false` means missing
-libapplegfx-vulkan silently drops the device.
+avoid overlaying a huge upstream file. `required: true` means missing
+libapplegfx-vulkan hard-fails meson configure with a clear pkg-config-not-found error.
 
 ### Kconfig changes (8 lines added)
 
