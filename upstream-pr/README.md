@@ -10,8 +10,8 @@ description (`PR_DESCRIPTION.md`), and a testing recipe
 
 | Package | Subject | Size | Status |
 |---------|---------|-----:|--------|
-| [A](./applesmc-fix/) | Fix `GET_KEY_BY_INDEX` and populate boot keys | 4 patches | **Ready to submit** |
-| [B](./apple-gfx-pci-linux/) | Linux-host port of `apple-gfx-pci` | 9 patches | **Blocked-ready** (library at `8edc43c`, packaging-path decision pending) |
+| [A](./applesmc-fix/) | Fix `GET_KEY_BY_INDEX` and populate Apple SMC key set | 2 patches | **SUBMITTED 2026-05-06** ([lore](https://lore.kernel.org/qemu-devel/20260507040153.14565-1-matthew@pq.io/)) |
+| [B](./apple-gfx-pci-linux/) | Linux-host port of `apple-gfx-pci` | 9 patches | **Blocked-ready** (library at `8edc43c`, packaging-path decision pending) — internal mos final-product helper, hold |
 | [C](./vmware-svga-caps/) | VMware SVGA II capability bits + 5K cap | 4 patches | **Ready to submit** |
 | [D](./usb-hid-apple-ids/) | USB HID Apple vendor IDs | 3 patches | **Ready to submit** |
 

@@ -521,15 +521,15 @@ static void applesmc_isa_realize(DeviceState *dev, Error **errp)
      * fraction. Returning zeroed sensors caused macOS to flag these as
      * broken and retry-poll. Values approximate a warm idle iMac20,1.
      */
-    applesmc_add_key(s, "TGDD", 2, "\x46\x00");  /* GPU diode: 70 C */
-    applesmc_add_key(s, "TG0P", 2, "\x41\x00");  /* GPU proximity: 65 C */
+    applesmc_add_key(s, "TGDD", 2, "\x2A\x00");  /* GPU diode: 42 C */
+    applesmc_add_key(s, "TG0P", 2, "\x24\x00");  /* GPU proximity: 36 C */
 
     /*
      * Fan control (iMac20,1 has one chassis fan). fpe2 format: raw
      * value is RPM << 2, big-endian. Idle ~1500 RPM, range 1200-3600.
      */
     applesmc_add_key(s, "FNum", 1, "\x01");
-    applesmc_add_key(s, "F0Ac", 2, "\x17\x70");  /* current: 1500 RPM */
+    applesmc_add_key(s, "F0Ac", 2, "\x12\xC0");  /* current: 1200 RPM (idle = F0Mn) */
     applesmc_add_key(s, "F0Mn", 2, "\x12\xC0");  /* min:     1200 RPM */
     applesmc_add_key(s, "F0Mx", 2, "\x38\x40");  /* max:     3600 RPM */
 
@@ -556,29 +556,29 @@ static void applesmc_isa_realize(DeviceState *dev, Error **errp)
      * readings in SP78 (big-endian) format; zeros trigger retry storms
      * on broken-sensor paths.
      */
-    applesmc_add_key(s, "TC0F", 2, "\x48\x00");  /* CPU PECI filt: 72 C */
-    applesmc_add_key(s, "TC0P", 2, "\x41\x00");  /* CPU proximity: 65 C */
-    applesmc_add_key(s, "TCXc", 2, "\x55\x00");  /* CPU core max: 85 C */
-    applesmc_add_key(s, "TG0F", 2, "\x41\x00");  /* GPU 0 filt: 65 C */
-    applesmc_add_key(s, "TG1F", 2, "\x41\x00");  /* GPU 1 filt: 65 C */
-    applesmc_add_key(s, "TH0P", 2, "\x2E\x00");  /* HDD proximity: 46 C */
+    applesmc_add_key(s, "TC0F", 2, "\x2D\x00");  /* CPU PECI filt: 45 C */
+    applesmc_add_key(s, "TC0P", 2, "\x28\x00");  /* CPU proximity: 40 C */
+    applesmc_add_key(s, "TCXc", 2, "\x33\x00");  /* CPU core max: 51 C */
+    applesmc_add_key(s, "TG0F", 2, "\x2A\x00");  /* GPU 0 filt: 42 C */
+    applesmc_add_key(s, "TG1F", 2, "\x2A\x00");  /* GPU 1 filt: 42 C */
+    applesmc_add_key(s, "TH0P", 2, "\x29\x00");  /* HDD proximity: 41 C */
     applesmc_add_key(s, "TH1A", 2, "\x1A\x00");  /* HDD 1 ambient: 26 C */
-    applesmc_add_key(s, "TH1C", 2, "\x2E\x00");  /* HDD 1 core: 46 C */
-    applesmc_add_key(s, "TH1F", 2, "\x2E\x00");  /* HDD 1 filt: 46 C */
-    applesmc_add_key(s, "TL0V", 2, "\x25\x00");  /* LCD 0: 37 C */
-    applesmc_add_key(s, "TL1V", 2, "\x27\x00");  /* LCD 1: 39 C */
-    applesmc_add_key(s, "TM0P", 2, "\x2D\x00");  /* memory prox: 45 C */
-    applesmc_add_key(s, "TM0V", 2, "\x2D\x00");  /* memory VRM: 45 C */
-    applesmc_add_key(s, "Tp00", 2, "\x1A\x00");  /* PSU: 26 C */
-    applesmc_add_key(s, "Tp2F", 2, "\x1A\x00");  /* PSU 2: 26 C */
-    applesmc_add_key(s, "Ts0S", 2, "\x1A\x00");  /* sensor 0: 26 C */
-    applesmc_add_key(s, "TS0V", 2, "\x1A\x00");  /* sensor 0 V: 26 C */
-    applesmc_add_key(s, "Ts1S", 2, "\x1A\x00");  /* sensor 1: 26 C */
-    applesmc_add_key(s, "Ts2S", 2, "\x1A\x00");  /* sensor 2: 26 C */
+    applesmc_add_key(s, "TH1C", 2, "\x29\x00");  /* HDD 1 core: 41 C */
+    applesmc_add_key(s, "TH1F", 2, "\x29\x00");  /* HDD 1 filt: 41 C */
+    applesmc_add_key(s, "TL0V", 2, "\x1D\x00");  /* LCD 0: 29 C */
+    applesmc_add_key(s, "TL1V", 2, "\x1C\x00");  /* LCD 1: 28 C */
+    applesmc_add_key(s, "TM0P", 2, "\x24\x00");  /* memory prox: 36 C */
+    applesmc_add_key(s, "TM0V", 2, "\x22\x00");  /* memory VRM: 34 C */
+    applesmc_add_key(s, "Tp00", 2, "\x21\x00");  /* PSU: 33 C */
+    applesmc_add_key(s, "Tp2F", 2, "\x21\x00");  /* PSU 2: 33 C */
+    applesmc_add_key(s, "Ts0S", 2, "\x21\x00");  /* sensor 0: 33 C */
+    applesmc_add_key(s, "TS0V", 2, "\x21\x00");  /* sensor 0 V: 33 C */
+    applesmc_add_key(s, "Ts1S", 2, "\x21\x00");  /* sensor 1: 33 C */
+    applesmc_add_key(s, "Ts2S", 2, "\x21\x00");  /* sensor 2: 33 C */
     applesmc_add_key(s, "TB0T", 2, "\x00\x00");  /* no battery */
     applesmc_add_key(s, "TB1T", 2, "\x00\x00");  /* no battery */
     applesmc_add_key(s, "TB2T", 2, "\x00\x00");  /* no battery */
-    applesmc_add_key(s, "TA0V", 2, "\x1A\x00");  /* ambient 0: 26 C */
+    applesmc_add_key(s, "TA0V", 2, "\x18\x00");  /* ambient 0: 24 C */
     applesmc_add_key(s, "TVMD", 2, "\x32\x00");  /* VRM diode: 50 C */
     applesmc_add_key(s, "TVmS", 2, "\x32\x00");  /* VRM sense: 50 C */
     applesmc_add_key(s, "TVSL", 2, "\x32\x00");  /* VRM sense L: 50 C */
