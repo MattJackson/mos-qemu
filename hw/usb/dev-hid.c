@@ -25,6 +25,7 @@
 
 #include "qemu/osdep.h"
 #include "ui/console.h"
+#include "ui/input.h"
 #include "hw/usb.h"
 #include "migration/vmstate.h"
 #include "desc.h"
@@ -881,27 +882,73 @@ static const TypeInfo usb_keyboard_info = {
  * incorrectly used boot-protocol HID instead of Apple's vendor
  * protocol and broke macOS recovery's HID stack.
  *
- * Phase 0: descriptors only. The IN endpoint is alive but no input
- * reports are sent yet. This stage tests whether
- * AppleUSBTopCaseHIDDriver binds, which removes the "Power On
+ * Phase 0 (closed): descriptors only — Interface 0 (vendor) alive,
+ * no input reports sent. Verified AppleUSBTopCaseHIDDriver binds
+ * (chain: AppleUSBTopCaseHIDDriver → AppleDeviceManagementHIDEvent
+ * Service → AppleUserHIDEventDriver), removing the "Power On
  * Bluetooth Keyboard" UI in macOS recovery.
  *
- * Phase 1+ (future): translate VNC keystrokes into Apple's report
- * 0xe0 / 0x9a vendor-encoded format and send via the IN endpoint.
+ * Phase 1 (THIS): add a SECOND HID interface (#1) implementing the
+ * standard USB HID boot keyboard protocol (UsagePage 0x07, Report
+ * ID 0x01, 10-byte input report — modifier byte + 7-slot keycode
+ * array). Real Magic Keyboards present this iface as well. We wire
+ * it to QEMU's input subsystem so VNC/SPICE keystrokes reach the
+ * macOS guest as standard HID Boot Keyboard events. Interface 0
+ * (vendor 0xff00) remains unchanged so the AppleUSBTopCaseHIDDriver
+ * binding from Phase 0 keeps working.
+ *
+ * Phase 2+ (future): translate VNC keystrokes into Apple's report
+ * 0xe0 / 0x9a vendor-encoded format on Interface 0 IN endpoint
+ * (so the AppleUSBTopCase stack receives keystrokes as well).
  */
+
+/*
+ * USB endpoint numbers within the apple-magic-keyboard device.
+ * EP1 IN = vendor-defined HID reports (Interface 0). Phase 0 only —
+ * still NAKed. EP2 IN = boot keyboard reports (Interface 1, Phase 1).
+ */
+#define AMK_EP_VENDOR_IN  1
+#define AMK_EP_BOOT_IN    2
+
+/*
+ * Apple Magic Keyboard boot-keyboard input report:
+ *   byte 0 — Report ID (0x01)
+ *   byte 1 — modifier byte (LCtrl=0x01 LShift=0x02 LAlt=0x04 LGUI=0x08
+ *            RCtrl=0x10 RShift=0x20 RAlt=0x40 RGUI=0x80)
+ *   byte 2 — reserved (0)
+ *   bytes 3..9 — up to 7 simultaneous HID Usage codes, 0 in unused slots
+ */
+#define AMK_BOOT_REPORT_ID    0x01
+#define AMK_BOOT_REPORT_LEN   10
+#define AMK_BOOT_NUM_KEYS     7
+
+typedef struct USBAppleMagicKbdState {
+    USBDevice                  dev;
+    USBEndpoint               *boot_intr;        /* EP2 IN */
+    QemuInputHandlerState     *input_handler;
+    /* Pressed-key state in HID Usage codes (UsagePage 0x07). */
+    uint8_t                    boot_modifiers;   /* live modifier byte */
+    uint8_t                    boot_keys[AMK_BOOT_NUM_KEYS]; /* live slots */
+    bool                       boot_changed;     /* report needs sending */
+} USBAppleMagicKbdState;
+
+#define TYPE_USB_APPLE_MAGIC_KBD "apple-magic-keyboard"
+OBJECT_DECLARE_SIMPLE_TYPE(USBAppleMagicKbdState, USB_APPLE_MAGIC_KBD)
 
 enum {
     STR_AMK_MFR = 1,
     STR_AMK_PRODUCT,
     STR_AMK_SERIAL,
     STR_AMK_INTERFACE,
+    STR_AMK_INTERFACE_BOOT,
 };
 
 static const USBDescStrings desc_strings_amk = {
-    [STR_AMK_MFR]       = "Apple Inc.",
-    [STR_AMK_PRODUCT]   = "Magic Keyboard with Numeric Keypad",
-    [STR_AMK_SERIAL]    = "F0T924300PCJKNCAS",
-    [STR_AMK_INTERFACE] = "Device Management",
+    [STR_AMK_MFR]            = "Apple Inc.",
+    [STR_AMK_PRODUCT]        = "Magic Keyboard with Numeric Keypad",
+    [STR_AMK_SERIAL]         = "F0T924300PCJKNCAS",
+    [STR_AMK_INTERFACE]      = "Device Management",
+    [STR_AMK_INTERFACE_BOOT] = "Boot Keyboard",
 };
 
 /*
@@ -962,35 +1009,127 @@ static const uint8_t apple_magic_kbd_hid_report_descriptor[] = {
     0xc0,                   /* END_COLLECTION */
 };
 
-static const USBDescIface desc_iface_apple_magic_kbd = {
-    .bInterfaceNumber              = 0,
-    .bNumEndpoints                 = 1,
-    .bInterfaceClass               = USB_CLASS_HID,
-    .bInterfaceSubClass            = 0x00,        /* NOT boot — vendor */
-    .bInterfaceProtocol            = 0x00,        /* NOT keyboard — vendor */
-    .iInterface                    = STR_AMK_INTERFACE,
-    .ndesc                         = 1,
-    .descs = (USBDescOther[]) {
-        {
-            /* HID descriptor */
-            .data = (uint8_t[]) {
-                0x09,                            /* bLength */
-                USB_DT_HID,                      /* bDescriptorType */
-                0x11, 0x01,                      /* bcdHID 1.11 */
-                0x00,                            /* bCountryCode */
-                0x01,                            /* bNumDescriptors */
-                USB_DT_REPORT,                   /* bDescriptorType: Report */
-                sizeof(apple_magic_kbd_hid_report_descriptor) & 0xff,
-                sizeof(apple_magic_kbd_hid_report_descriptor) >> 8,
+/*
+ * Phase 1: Interface 1 — standard USB HID Boot Keyboard.
+ *
+ * UsagePage 0x07 (Keyboard/Keypad), one Application collection with
+ * Report ID 0x01:
+ *   8 bits modifier (UsageMin 0xE0 / UsageMax 0xE7)
+ *   8 bits reserved (Const)
+ *   5 bits LED output (UsagePage 0x08, UsageMin 1, UsageMax 5)
+ *   3 bits LED padding (Const)
+ *   7 keycode slots (8 bits each, UsageMin 0, UsageMax 0xFF)
+ *
+ * Total input report = ReportID byte + 9 data bytes = 10 bytes.
+ * Total output report (LEDs) = ReportID byte + 1 data byte = 2 bytes.
+ * Real Magic Keyboards expose a similar boot-keyboard interface
+ * alongside the vendor (UsagePage 0xff00) interface.
+ */
+static const uint8_t apple_magic_kbd_boot_hid_report_descriptor[] = {
+    0x05, 0x07,             /* Usage Page (Keyboard/Keypad) */
+    0x09, 0x06,             /* Usage (Keyboard) */
+    0xa1, 0x01,             /* Collection (Application) */
+    0x85, AMK_BOOT_REPORT_ID, /*   Report ID (1) */
+    /* 8 modifier bits (0xE0..0xE7) */
+    0x05, 0x07,             /*   Usage Page (Keyboard/Keypad) */
+    0x19, 0xe0,             /*   Usage Minimum (224) */
+    0x29, 0xe7,             /*   Usage Maximum (231) */
+    0x15, 0x00,             /*   Logical Minimum (0) */
+    0x25, 0x01,             /*   Logical Maximum (1) */
+    0x75, 0x01,             /*   Report Size (1) */
+    0x95, 0x08,             /*   Report Count (8) */
+    0x81, 0x02,             /*   Input (Data, Variable, Absolute) */
+    /* reserved byte */
+    0x95, 0x01,             /*   Report Count (1) */
+    0x75, 0x08,             /*   Report Size (8) */
+    0x81, 0x01,             /*   Input (Constant) */
+    /* 5 LED output bits + 3 padding */
+    0x95, 0x05,             /*   Report Count (5) */
+    0x75, 0x01,             /*   Report Size (1) */
+    0x05, 0x08,             /*   Usage Page (LEDs) */
+    0x19, 0x01,             /*   Usage Minimum (1) */
+    0x29, 0x05,             /*   Usage Maximum (5) */
+    0x91, 0x02,             /*   Output (Data, Variable, Absolute) */
+    0x95, 0x01,             /*   Report Count (1) */
+    0x75, 0x03,             /*   Report Size (3) */
+    0x91, 0x01,             /*   Output (Constant) */
+    /* 7 keycode slots (8 bits each) */
+    0x95, AMK_BOOT_NUM_KEYS, /*   Report Count (7) */
+    0x75, 0x08,             /*   Report Size (8) */
+    0x15, 0x00,             /*   Logical Minimum (0) */
+    0x26, 0xff, 0x00,       /*   Logical Maximum (255) */
+    0x05, 0x07,             /*   Usage Page (Keyboard/Keypad) */
+    0x19, 0x00,             /*   Usage Minimum (0) */
+    0x29, 0xff,             /*   Usage Maximum (255) */
+    0x81, 0x00,             /*   Input (Data, Array) */
+    0xc0,                   /* End Collection */
+};
+
+static const USBDescIface desc_iface_apple_magic_kbd[] = {
+    {
+        /* Interface 0: vendor HID (Phase 0). */
+        .bInterfaceNumber              = 0,
+        .bNumEndpoints                 = 1,
+        .bInterfaceClass               = USB_CLASS_HID,
+        .bInterfaceSubClass            = 0x00,    /* NOT boot — vendor */
+        .bInterfaceProtocol            = 0x00,    /* NOT keyboard — vendor */
+        .iInterface                    = STR_AMK_INTERFACE,
+        .ndesc                         = 1,
+        .descs = (USBDescOther[]) {
+            {
+                /* HID descriptor */
+                .data = (uint8_t[]) {
+                    0x09,                            /* bLength */
+                    USB_DT_HID,                      /* bDescriptorType */
+                    0x11, 0x01,                      /* bcdHID 1.11 */
+                    0x00,                            /* bCountryCode */
+                    0x01,                            /* bNumDescriptors */
+                    USB_DT_REPORT,                   /* bDescriptorType: Report */
+                    sizeof(apple_magic_kbd_hid_report_descriptor) & 0xff,
+                    sizeof(apple_magic_kbd_hid_report_descriptor) >> 8,
+                },
+            },
+        },
+        .eps = (USBDescEndpoint[]) {
+            {
+                .bEndpointAddress      = USB_DIR_IN | AMK_EP_VENDOR_IN,
+                .bmAttributes          = USB_ENDPOINT_XFER_INT,
+                .wMaxPacketSize        = 8,
+                .bInterval             = 7, /* 2 ^ (8-1) * 125 us = 8 ms */
             },
         },
     },
-    .eps = (USBDescEndpoint[]) {
-        {
-            .bEndpointAddress      = USB_DIR_IN | 0x01,
-            .bmAttributes          = USB_ENDPOINT_XFER_INT,
-            .wMaxPacketSize        = 8,
-            .bInterval             = 7, /* 2 ^ (8-1) * 125 us = 8 ms; matches real */
+    {
+        /* Interface 1: boot keyboard (Phase 1). */
+        .bInterfaceNumber              = 1,
+        .bNumEndpoints                 = 1,
+        .bInterfaceClass               = USB_CLASS_HID,
+        .bInterfaceSubClass            = 0x01,    /* boot */
+        .bInterfaceProtocol            = 0x01,    /* keyboard */
+        .iInterface                    = STR_AMK_INTERFACE_BOOT,
+        .ndesc                         = 1,
+        .descs = (USBDescOther[]) {
+            {
+                /* HID descriptor */
+                .data = (uint8_t[]) {
+                    0x09,                            /* bLength */
+                    USB_DT_HID,                      /* bDescriptorType */
+                    0x11, 0x01,                      /* bcdHID 1.11 */
+                    0x00,                            /* bCountryCode */
+                    0x01,                            /* bNumDescriptors */
+                    USB_DT_REPORT,                   /* bDescriptorType: Report */
+                    sizeof(apple_magic_kbd_boot_hid_report_descriptor) & 0xff,
+                    sizeof(apple_magic_kbd_boot_hid_report_descriptor) >> 8,
+                },
+            },
+        },
+        .eps = (USBDescEndpoint[]) {
+            {
+                .bEndpointAddress      = USB_DIR_IN | AMK_EP_BOOT_IN,
+                .bmAttributes          = USB_ENDPOINT_XFER_INT,
+                .wMaxPacketSize        = AMK_BOOT_REPORT_LEN,
+                .bInterval             = 8, /* 2 ^ (8-1) * 125 us = 8 ms */
+            },
         },
     },
 };
@@ -1001,13 +1140,13 @@ static const USBDescDevice desc_device_apple_magic_kbd = {
     .bNumConfigurations            = 1,
     .confs = (USBDescConfig[]) {
         {
-            .bNumInterfaces        = 1,
+            .bNumInterfaces        = 2,
             .bConfigurationValue   = 1,
             .iConfiguration        = STR_AMK_PRODUCT,
             .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
             .bMaxPower             = 250, /* 500 mA — matches real */
-            .nif                   = 1,
-            .ifs                   = &desc_iface_apple_magic_kbd,
+            .nif                   = ARRAY_SIZE(desc_iface_apple_magic_kbd),
+            .ifs                   = desc_iface_apple_magic_kbd,
         },
     },
 };
@@ -1032,14 +1171,254 @@ static const USBDesc desc_apple_magic_kbd = {
     .str  = desc_strings_amk,
 };
 
+/*
+ * QKeyCode → USB HID Usage Code (UsagePage 0x07).
+ *
+ * Self-contained map so the apple-magic-keyboard implementation does
+ * not have to share state with hw/input/hid.c (whose hid_usage_keys[]
+ * is static and indexed by atset1 scancode). We only need the HID
+ * Usage value here — modifier vs slot keys are distinguished by
+ * value range (0xE0..0xE7 = modifier).
+ *
+ * Entries left at 0 are unmapped and ignored.
+ */
+static const uint8_t apple_magic_kbd_qcode_to_hid_usage[Q_KEY_CODE__MAX] = {
+    /* Letters */
+    [Q_KEY_CODE_A] = 0x04, [Q_KEY_CODE_B] = 0x05, [Q_KEY_CODE_C] = 0x06,
+    [Q_KEY_CODE_D] = 0x07, [Q_KEY_CODE_E] = 0x08, [Q_KEY_CODE_F] = 0x09,
+    [Q_KEY_CODE_G] = 0x0a, [Q_KEY_CODE_H] = 0x0b, [Q_KEY_CODE_I] = 0x0c,
+    [Q_KEY_CODE_J] = 0x0d, [Q_KEY_CODE_K] = 0x0e, [Q_KEY_CODE_L] = 0x0f,
+    [Q_KEY_CODE_M] = 0x10, [Q_KEY_CODE_N] = 0x11, [Q_KEY_CODE_O] = 0x12,
+    [Q_KEY_CODE_P] = 0x13, [Q_KEY_CODE_Q] = 0x14, [Q_KEY_CODE_R] = 0x15,
+    [Q_KEY_CODE_S] = 0x16, [Q_KEY_CODE_T] = 0x17, [Q_KEY_CODE_U] = 0x18,
+    [Q_KEY_CODE_V] = 0x19, [Q_KEY_CODE_W] = 0x1a, [Q_KEY_CODE_X] = 0x1b,
+    [Q_KEY_CODE_Y] = 0x1c, [Q_KEY_CODE_Z] = 0x1d,
+    /* Top-row digits 1..0 */
+    [Q_KEY_CODE_1] = 0x1e, [Q_KEY_CODE_2] = 0x1f, [Q_KEY_CODE_3] = 0x20,
+    [Q_KEY_CODE_4] = 0x21, [Q_KEY_CODE_5] = 0x22, [Q_KEY_CODE_6] = 0x23,
+    [Q_KEY_CODE_7] = 0x24, [Q_KEY_CODE_8] = 0x25, [Q_KEY_CODE_9] = 0x26,
+    [Q_KEY_CODE_0] = 0x27,
+    /* Editing / whitespace */
+    [Q_KEY_CODE_RET]            = 0x28,
+    [Q_KEY_CODE_ESC]            = 0x29,
+    [Q_KEY_CODE_BACKSPACE]      = 0x2a,
+    [Q_KEY_CODE_TAB]            = 0x2b,
+    [Q_KEY_CODE_SPC]            = 0x2c,
+    [Q_KEY_CODE_MINUS]          = 0x2d,
+    [Q_KEY_CODE_EQUAL]          = 0x2e,
+    [Q_KEY_CODE_BRACKET_LEFT]   = 0x2f,
+    [Q_KEY_CODE_BRACKET_RIGHT]  = 0x30,
+    [Q_KEY_CODE_BACKSLASH]      = 0x31,
+    [Q_KEY_CODE_SEMICOLON]      = 0x33,
+    [Q_KEY_CODE_APOSTROPHE]     = 0x34,
+    [Q_KEY_CODE_GRAVE_ACCENT]   = 0x35,
+    [Q_KEY_CODE_COMMA]          = 0x36,
+    [Q_KEY_CODE_DOT]            = 0x37,
+    [Q_KEY_CODE_SLASH]          = 0x38,
+    [Q_KEY_CODE_CAPS_LOCK]      = 0x39,
+    /* Function row F1..F12 */
+    [Q_KEY_CODE_F1]  = 0x3a, [Q_KEY_CODE_F2]  = 0x3b, [Q_KEY_CODE_F3]  = 0x3c,
+    [Q_KEY_CODE_F4]  = 0x3d, [Q_KEY_CODE_F5]  = 0x3e, [Q_KEY_CODE_F6]  = 0x3f,
+    [Q_KEY_CODE_F7]  = 0x40, [Q_KEY_CODE_F8]  = 0x41, [Q_KEY_CODE_F9]  = 0x42,
+    [Q_KEY_CODE_F10] = 0x43, [Q_KEY_CODE_F11] = 0x44, [Q_KEY_CODE_F12] = 0x45,
+    /* Print / lock / pause */
+    [Q_KEY_CODE_PRINT]       = 0x46,
+    [Q_KEY_CODE_SCROLL_LOCK] = 0x47,
+    [Q_KEY_CODE_PAUSE]       = 0x48,
+    /* Editing block */
+    [Q_KEY_CODE_INSERT]      = 0x49,
+    [Q_KEY_CODE_HOME]        = 0x4a,
+    [Q_KEY_CODE_PGUP]        = 0x4b,
+    [Q_KEY_CODE_DELETE]      = 0x4c,
+    [Q_KEY_CODE_END]         = 0x4d,
+    [Q_KEY_CODE_PGDN]        = 0x4e,
+    [Q_KEY_CODE_RIGHT]       = 0x4f,
+    [Q_KEY_CODE_LEFT]        = 0x50,
+    [Q_KEY_CODE_DOWN]        = 0x51,
+    [Q_KEY_CODE_UP]          = 0x52,
+    /* Keypad */
+    [Q_KEY_CODE_NUM_LOCK]    = 0x53,
+    [Q_KEY_CODE_KP_DIVIDE]   = 0x54,
+    [Q_KEY_CODE_KP_MULTIPLY] = 0x55,
+    [Q_KEY_CODE_ASTERISK]    = 0x55, /* duplicate name in qcode table */
+    [Q_KEY_CODE_KP_SUBTRACT] = 0x56,
+    [Q_KEY_CODE_KP_ADD]      = 0x57,
+    [Q_KEY_CODE_KP_ENTER]    = 0x58,
+    [Q_KEY_CODE_KP_1]        = 0x59,
+    [Q_KEY_CODE_KP_2]        = 0x5a,
+    [Q_KEY_CODE_KP_3]        = 0x5b,
+    [Q_KEY_CODE_KP_4]        = 0x5c,
+    [Q_KEY_CODE_KP_5]        = 0x5d,
+    [Q_KEY_CODE_KP_6]        = 0x5e,
+    [Q_KEY_CODE_KP_7]        = 0x5f,
+    [Q_KEY_CODE_KP_8]        = 0x60,
+    [Q_KEY_CODE_KP_9]        = 0x61,
+    [Q_KEY_CODE_KP_0]        = 0x62,
+    [Q_KEY_CODE_KP_DECIMAL]  = 0x63,
+    [Q_KEY_CODE_LESS]        = 0x64, /* non-US backslash / ISO key */
+    [Q_KEY_CODE_KP_EQUALS]   = 0x67,
+    /* F13..F24 */
+    [Q_KEY_CODE_F13] = 0x68, [Q_KEY_CODE_F14] = 0x69, [Q_KEY_CODE_F15] = 0x6a,
+    [Q_KEY_CODE_F16] = 0x6b, [Q_KEY_CODE_F17] = 0x6c, [Q_KEY_CODE_F18] = 0x6d,
+    [Q_KEY_CODE_F19] = 0x6e, [Q_KEY_CODE_F20] = 0x6f, [Q_KEY_CODE_F21] = 0x70,
+    [Q_KEY_CODE_F22] = 0x71, [Q_KEY_CODE_F23] = 0x72, [Q_KEY_CODE_F24] = 0x73,
+    /* Misc named keys */
+    [Q_KEY_CODE_HELP]    = 0x75,
+    [Q_KEY_CODE_MENU]    = 0x76,
+    [Q_KEY_CODE_STOP]    = 0x78,
+    [Q_KEY_CODE_AGAIN]   = 0x79,
+    [Q_KEY_CODE_UNDO]    = 0x7a,
+    [Q_KEY_CODE_CUT]     = 0x7b,
+    [Q_KEY_CODE_COPY]    = 0x7c,
+    [Q_KEY_CODE_PASTE]   = 0x7d,
+    [Q_KEY_CODE_FIND]    = 0x7e,
+    [Q_KEY_CODE_AUDIOMUTE]   = 0x7f,
+    [Q_KEY_CODE_VOLUMEUP]    = 0x80,
+    [Q_KEY_CODE_VOLUMEDOWN]  = 0x81,
+    [Q_KEY_CODE_KP_COMMA]    = 0x85,
+    [Q_KEY_CODE_RO]              = 0x87, /* Intl1 (Japanese RO) */
+    [Q_KEY_CODE_KATAKANAHIRAGANA]= 0x88, /* Intl2 */
+    [Q_KEY_CODE_YEN]             = 0x89, /* Intl3 */
+    [Q_KEY_CODE_HENKAN]          = 0x8a, /* Intl4 */
+    [Q_KEY_CODE_MUHENKAN]        = 0x8b, /* Intl5 */
+    [Q_KEY_CODE_HIRAGANA]        = 0x91, /* LANG4 (close enough) */
+    [Q_KEY_CODE_LANG1]           = 0x90,
+    [Q_KEY_CODE_LANG2]           = 0x91,
+    /* Modifiers — HID Usages 0xE0..0xE7 (also written into modifier byte). */
+    [Q_KEY_CODE_CTRL]    = 0xe0,
+    [Q_KEY_CODE_SHIFT]   = 0xe1,
+    [Q_KEY_CODE_ALT]     = 0xe2,
+    [Q_KEY_CODE_META_L]  = 0xe3,
+    [Q_KEY_CODE_CTRL_R]  = 0xe4,
+    [Q_KEY_CODE_SHIFT_R] = 0xe5,
+    [Q_KEY_CODE_ALT_R]   = 0xe6,
+    [Q_KEY_CODE_META_R]  = 0xe7,
+};
+
+/*
+ * Pack the live boot-keyboard state into a 10-byte report payload.
+ *   buf[0]    = report ID (0x01)
+ *   buf[1]    = modifier byte
+ *   buf[2]    = reserved (0)
+ *   buf[3..9] = 7 keycode slots
+ */
+static void apple_magic_kbd_pack_boot_report(USBAppleMagicKbdState *s,
+                                             uint8_t buf[AMK_BOOT_REPORT_LEN])
+{
+    buf[0] = AMK_BOOT_REPORT_ID;
+    buf[1] = s->boot_modifiers;
+    buf[2] = 0;
+    memcpy(&buf[3], s->boot_keys, AMK_BOOT_NUM_KEYS);
+}
+
+/* Update s->boot_modifiers / s->boot_keys for one HID Usage, then mark
+ * the report dirty. Returns true if state actually changed. */
+static bool apple_magic_kbd_apply_usage(USBAppleMagicKbdState *s,
+                                        uint8_t usage, bool down)
+{
+    int i;
+
+    if (usage == 0) {
+        return false;
+    }
+
+    /* Modifiers — packed bitmap into the modifier byte. */
+    if (usage >= 0xe0 && usage <= 0xe7) {
+        uint8_t bit = 1u << (usage - 0xe0);
+        uint8_t prev = s->boot_modifiers;
+        if (down) {
+            s->boot_modifiers |= bit;
+        } else {
+            s->boot_modifiers &= ~bit;
+        }
+        return s->boot_modifiers != prev;
+    }
+
+    /* Slot keys — 7-slot array, no duplicates. */
+    if (down) {
+        for (i = 0; i < AMK_BOOT_NUM_KEYS; i++) {
+            if (s->boot_keys[i] == usage) {
+                return false;        /* already pressed */
+            }
+        }
+        for (i = 0; i < AMK_BOOT_NUM_KEYS; i++) {
+            if (s->boot_keys[i] == 0) {
+                s->boot_keys[i] = usage;
+                return true;
+            }
+        }
+        /* Roll-over — slots full. Per HID spec, every slot should be
+         * 0x01 (ErrorRollOver). For Phase 1 simplicity we just drop;
+         * VNC / single-user input isn't going to produce 8+ chord keys
+         * in normal use. */
+        return false;
+    } else {
+        for (i = 0; i < AMK_BOOT_NUM_KEYS; i++) {
+            if (s->boot_keys[i] == usage) {
+                /* Compact slots so packed array stays contiguous. */
+                int j;
+                for (j = i; j < AMK_BOOT_NUM_KEYS - 1; j++) {
+                    s->boot_keys[j] = s->boot_keys[j + 1];
+                }
+                s->boot_keys[AMK_BOOT_NUM_KEYS - 1] = 0;
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+static void apple_magic_kbd_input_event(DeviceState *dev, QemuConsole *src,
+                                        InputEvent *evt)
+{
+    USBAppleMagicKbdState *s = USB_APPLE_MAGIC_KBD(dev);
+    InputKeyEvent *key;
+    int qcode;
+    uint8_t usage;
+
+    if (evt->type != INPUT_EVENT_KIND_KEY) {
+        return;
+    }
+
+    key = evt->u.key.data;
+    qcode = qemu_input_key_value_to_qcode(key->key);
+    if (qcode < 0 || qcode >= Q_KEY_CODE__MAX) {
+        return;
+    }
+    usage = apple_magic_kbd_qcode_to_hid_usage[qcode];
+    if (usage == 0) {
+        return;
+    }
+
+    if (apple_magic_kbd_apply_usage(s, usage, key->down)) {
+        s->boot_changed = true;
+        if (s->boot_intr) {
+            usb_wakeup(s->boot_intr, 0);
+        }
+    }
+}
+
+static const QemuInputHandler apple_magic_kbd_input_handler = {
+    .name  = "Apple Magic Keyboard (boot)",
+    .mask  = INPUT_EVENT_MASK_KEY,
+    .event = apple_magic_kbd_input_event,
+};
+
 static void usb_apple_magic_kbd_realize(USBDevice *dev, Error **errp)
 {
+    USBAppleMagicKbdState *s = USB_APPLE_MAGIC_KBD(dev);
+
     /*
      * uc->usb_desc set in class_init handles dev->usb_desc selection.
      * Mirror Wacom's pattern: just set up the serial + descriptors.
      */
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
+
+    s->boot_intr = usb_ep_get(dev, USB_TOKEN_IN, AMK_EP_BOOT_IN);
+    s->input_handler = qemu_input_handler_register(DEVICE(s),
+                                            &apple_magic_kbd_input_handler);
+    qemu_input_handler_activate(s->input_handler);
 }
 
 static const VMStateDescription vmstate_apple_magic_kbd = {
@@ -1049,7 +1428,11 @@ static const VMStateDescription vmstate_apple_magic_kbd = {
 
 static void usb_apple_magic_kbd_handle_reset(USBDevice *dev)
 {
-    /* Phase 0: nothing to reset (no input state yet). */
+    USBAppleMagicKbdState *s = USB_APPLE_MAGIC_KBD(dev);
+
+    s->boot_modifiers = 0;
+    memset(s->boot_keys, 0, sizeof(s->boot_keys));
+    s->boot_changed = false;
 }
 
 static void usb_apple_magic_kbd_handle_control(USBDevice *dev, USBPacket *p,
@@ -1057,6 +1440,7 @@ static void usb_apple_magic_kbd_handle_control(USBDevice *dev, USBPacket *p,
                                               int index, int length,
                                               uint8_t *data)
 {
+    USBAppleMagicKbdState *s = USB_APPLE_MAGIC_KBD(dev);
     int ret;
 
     ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
@@ -1067,10 +1451,23 @@ static void usb_apple_magic_kbd_handle_control(USBDevice *dev, USBPacket *p,
     switch (request) {
     case InterfaceRequest | USB_REQ_GET_DESCRIPTOR:
         if ((value >> 8) == 0x22) {
-            /* GET_DESCRIPTOR(REPORT) — return Apple vendor HID descriptor. */
-            uint16_t rd_len = sizeof(apple_magic_kbd_hid_report_descriptor);
-            uint16_t copy = length < rd_len ? length : rd_len;
-            memcpy(data, apple_magic_kbd_hid_report_descriptor, copy);
+            /*
+             * GET_DESCRIPTOR(REPORT). Pick the right report descriptor
+             * based on the interface index in wIndex. Interface 0 =
+             * Apple vendor HID; Interface 1 = boot keyboard.
+             */
+            const uint8_t *rd;
+            uint16_t rd_len;
+            uint16_t copy;
+            if (index == 1) {
+                rd     = apple_magic_kbd_boot_hid_report_descriptor;
+                rd_len = sizeof(apple_magic_kbd_boot_hid_report_descriptor);
+            } else {
+                rd     = apple_magic_kbd_hid_report_descriptor;
+                rd_len = sizeof(apple_magic_kbd_hid_report_descriptor);
+            }
+            copy = length < rd_len ? length : rd_len;
+            memcpy(data, rd, copy);
             p->actual_length = copy;
             return;
         }
@@ -1089,24 +1486,46 @@ static void usb_apple_magic_kbd_handle_control(USBDevice *dev, USBPacket *p,
         return;
     case HID_GET_REPORT: {
         /*
-         * Phase 0: blanket-ACK feature GET_REPORT with zero-filled
-         * payload of the declared report size. Stalling these would
-         * send AppleUSBTopCaseHIDDriver into a tight retry loop on
-         * match-probe, which has empirically been observed to amplify
-         * through KVM into host scheduler pressure (the docker host
-         * wedge of 2026-05-07). Linux's apple_probe path issues no
-         * control transfers, so the wedge cause must be macOS-specific
-         * feature-report polling.
+         * GET_REPORT — feature/input poll over EP0. Behaviour depends
+         * on the interface index in wIndex.
          *
-         * Match the per-Report-ID sizes declared in our HID Report
-         * Descriptor (above):
+         * Interface 0 (vendor): blanket-ACK with zero-filled payload of
+         * the declared report size. Stalling these would send
+         * AppleUSBTopCaseHIDDriver into a tight retry loop on match-
+         * probe (host wedge of 2026-05-07). Match the per-Report-ID
+         * sizes declared in the vendor HID Report Descriptor:
          *   0xe0 → 4 bytes  (input only, but driver may probe Feature)
          *   0x9a → 1 byte
          *   0x90 → 2 bytes  (AC/charge bits + battery byte)
-         * Default:    return zeros of the requested 'length' bytes.
+         * Default: zeros of the requested 'length' bytes.
+         *
+         * Interface 1 (boot keyboard): synthesize an input report from
+         * current boot state if the host requests Report ID 0x01.
          */
         uint8_t report_id = value & 0xff;
+        uint8_t report_type = (value >> 8) & 0xff;
         uint16_t reply_len;
+
+        if (index == 1) {
+            uint8_t buf[AMK_BOOT_REPORT_LEN];
+            if (report_type == 0x01 /* Input */ &&
+                report_id == AMK_BOOT_REPORT_ID) {
+                apple_magic_kbd_pack_boot_report(s, buf);
+                reply_len = AMK_BOOT_REPORT_LEN;
+                if (reply_len > length) {
+                    reply_len = length;
+                }
+                memcpy(data, buf, reply_len);
+                p->actual_length = reply_len;
+                return;
+            }
+            /* Other report types/IDs on the boot iface — ack with zeros. */
+            reply_len = (length > 0 && length <= 64) ? length : 1;
+            memset(data, 0, reply_len);
+            p->actual_length = reply_len;
+            return;
+        }
+
         switch (report_id) {
         case 0xe0: reply_len = 4; break;
         case 0x9a: reply_len = 1; break;
@@ -1122,11 +1541,13 @@ static void usb_apple_magic_kbd_handle_control(USBDevice *dev, USBPacket *p,
     }
     case HID_SET_REPORT:
         /*
-         * Phase 0: silently accept SET_REPORT writes (e.g. raw-multi-
-         * touch enable on the trackpad). Returning without changing
-         * p->status acknowledges the transfer; data ignored for now.
-         * Phase 1+: parse vendor SET_REPORTs (0x02, 0xF1) per Linux
+         * Interface 0 (vendor): silently accept SET_REPORT writes
+         * (e.g. raw-multi-touch enable on the trackpad). Phase 2+:
+         * parse vendor SET_REPORTs (0x02, 0xF1) per Linux
          * magicmouse_enable_multitouch().
+         *
+         * Interface 1 (boot keyboard): ACK SET_REPORT (LED state).
+         * We don't drive any host-visible LEDs yet but must not stall.
          */
         return;
     }
@@ -1136,21 +1557,51 @@ static void usb_apple_magic_kbd_handle_control(USBDevice *dev, USBPacket *p,
 
 static void usb_apple_magic_kbd_handle_data(USBDevice *dev, USBPacket *p)
 {
-    /*
-     * Phase 0: no input data. NAK the IN endpoint poll so the host
-     * keeps polling without erroring. Once Phase 1 lands we'll fill
-     * data with an Apple-encoded report and set p->actual_length.
-     */
-    if (p->pid == USB_TOKEN_IN && p->ep->nr == 1) {
-        p->status = USB_RET_NAK;
+    USBAppleMagicKbdState *s = USB_APPLE_MAGIC_KBD(dev);
+
+    if (p->pid != USB_TOKEN_IN) {
+        p->status = USB_RET_STALL;
         return;
     }
-    p->status = USB_RET_STALL;
+
+    switch (p->ep->nr) {
+    case AMK_EP_VENDOR_IN:
+        /*
+         * Phase 0 still: vendor IN endpoint has no input data. NAK so
+         * the host keeps polling without erroring. Phase 2+ will fill
+         * with Apple-encoded reports.
+         */
+        p->status = USB_RET_NAK;
+        return;
+    case AMK_EP_BOOT_IN: {
+        uint8_t buf[AMK_BOOT_REPORT_LEN];
+        size_t copy;
+
+        if (!s->boot_changed) {
+            p->status = USB_RET_NAK;
+            return;
+        }
+        s->boot_changed = false;
+        apple_magic_kbd_pack_boot_report(s, buf);
+        copy = p->iov.size < AMK_BOOT_REPORT_LEN
+             ? p->iov.size : AMK_BOOT_REPORT_LEN;
+        usb_packet_copy(p, buf, copy);
+        return;
+    }
+    default:
+        p->status = USB_RET_STALL;
+        return;
+    }
 }
 
 static void usb_apple_magic_kbd_unrealize(USBDevice *dev)
 {
-    /* Phase 0: nothing to free. */
+    USBAppleMagicKbdState *s = USB_APPLE_MAGIC_KBD(dev);
+
+    if (s->input_handler) {
+        qemu_input_handler_unregister(s->input_handler);
+        s->input_handler = NULL;
+    }
 }
 
 static void usb_apple_magic_kbd_class_initfn(ObjectClass *klass,
@@ -1173,9 +1624,9 @@ static void usb_apple_magic_kbd_class_initfn(ObjectClass *klass,
 }
 
 static const TypeInfo usb_apple_magic_kbd_info = {
-    .name          = "apple-magic-keyboard",
+    .name          = TYPE_USB_APPLE_MAGIC_KBD,
     .parent        = TYPE_USB_DEVICE,
-    .instance_size = sizeof(USBDevice),
+    .instance_size = sizeof(USBAppleMagicKbdState),
     .class_init    = usb_apple_magic_kbd_class_initfn,
 };
 
