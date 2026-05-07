@@ -1167,6 +1167,264 @@ static const TypeInfo usb_apple_tablet_info = {
     .class_init    = usb_apple_tablet_class_initfn,
 };
 
+/*
+ * apple-magic-keyboard
+ * --------------------
+ *
+ * Mimics the real Apple Magic Keyboard with Numeric Keypad in USB
+ * mode (idVendor 0x05ac, idProduct 0x026c). Unlike the apple-kbd
+ * descriptor wrapper (above), this device ships Apple's
+ * vendor-defined HID protocol on UsagePage 0xff00 — the protocol
+ * AppleUSBTopCaseHIDDriver actually probes for. The descriptors and
+ * HID report descriptor here are byte-identical to those captured
+ * from a real Mac with a Magic Keyboard plugged in via USB cable,
+ * documented in
+ * mos/paravirt-re/library/apple-magic-hid/.
+ *
+ * Phase 0: descriptors only. The IN endpoint is alive but no input
+ * reports are sent yet. This stage tests whether
+ * AppleUSBTopCaseHIDDriver binds, which removes the "Power On
+ * Bluetooth Keyboard" UI in macOS recovery.
+ *
+ * Phase 1+ (future): translate VNC keystrokes into Apple's report
+ * 0xe0 / 0x9a vendor-encoded format and send via the IN endpoint.
+ */
+
+enum {
+    STR_AMK_MFR = 1,
+    STR_AMK_PRODUCT,
+    STR_AMK_SERIAL,
+    STR_AMK_INTERFACE,
+};
+
+static const USBDescStrings desc_strings_amk = {
+    [STR_AMK_MFR]       = "Apple Inc.",
+    [STR_AMK_PRODUCT]   = "Magic Keyboard with Numeric Keypad",
+    [STR_AMK_SERIAL]    = "F0T924300PCJKNCAS",
+    [STR_AMK_INTERFACE] = "Device Management",
+};
+
+/*
+ * HID Report Descriptor — byte-identical to a real Magic Keyboard
+ * with Numeric Keypad over USB. Vendor-defined UsagePage 0xff00.
+ *
+ * Three input report IDs (real device's "InputReportElements"):
+ *   0xe0:  4 bytes — Apple-encoded keyboard event payload (keys / mods)
+ *   0x9a:  1 byte  — short-form vendor signal
+ *   0x90:  3 bytes — power/battery status (charging, AC, percent)
+ *
+ * Decoded layout (see project_apple_magic_hid_emulator_2026_05_07.md):
+ *   Application 1: UsagePage 0xff00 / Usage 0x0b — keystrokes + signals
+ *   Application 2: UsagePage 0xff00 / Usage 0x14 — power/battery
+ */
+static const uint8_t apple_magic_kbd_hid_report_descriptor[] = {
+    /* Application 1: keystroke / vendor signal */
+    0x06, 0x00, 0xff,       /* USAGE_PAGE (Vendor 0xff00) */
+    0x09, 0x0b,             /* USAGE (0x0b) */
+    0xa1, 0x01,             /* COLLECTION (Application) */
+    0x06, 0x00, 0xff,       /*   USAGE_PAGE (Vendor 0xff00) */
+    0x09, 0x0b,             /*   USAGE (0x0b) */
+    0x15, 0x00,             /*   LOGICAL_MINIMUM (0) */
+    0x26, 0xff, 0x00,       /*   LOGICAL_MAXIMUM (255) */
+    0x75, 0x08,             /*   REPORT_SIZE (8) */
+    0x96, 0x04, 0x00,       /*   REPORT_COUNT (4)        Report 0xe0 = 4 bytes */
+    0x85, 0xe0,             /*   REPORT_ID (0xe0) */
+    0x81, 0x22,             /*   INPUT (Data,Var,Abs,NoPref) */
+    0x09, 0x0b,             /*   USAGE (0x0b) */
+    0x96, 0x01, 0x00,       /*   REPORT_COUNT (1)        Report 0x9a = 1 byte */
+    0x85, 0x9a,             /*   REPORT_ID (0x9a) */
+    0x81, 0x22,             /*   INPUT (Data,Var,Abs,NoPref) */
+    0xc0,                   /* END_COLLECTION */
+
+    /* Application 2: power / battery */
+    0x06, 0x00, 0xff,       /* USAGE_PAGE (Vendor 0xff00) */
+    0x09, 0x14,             /* USAGE (0x14) */
+    0xa1, 0x01,             /* COLLECTION (Application) */
+    0x85, 0x90,             /*   REPORT_ID (0x90) */
+    0x05, 0x84,             /*   USAGE_PAGE (Power Device) */
+    0x75, 0x01,             /*   REPORT_SIZE (1) */
+    0x95, 0x03,             /*   REPORT_COUNT (3)        3 status bits */
+    0x15, 0x00,             /*   LOGICAL_MINIMUM (0) */
+    0x25, 0x01,             /*   LOGICAL_MAXIMUM (1) */
+    0x09, 0x61,             /*   USAGE (AC mains) */
+    0x05, 0x85,             /*   USAGE_PAGE (Battery System) */
+    0x09, 0x44,             /*   USAGE (Charging) */
+    0x09, 0x46,             /*   USAGE (NeedReplacement) */
+    0x81, 0x02,             /*   INPUT (Data,Var,Abs) */
+    0x95, 0x05,             /*   REPORT_COUNT (5)        5-bit padding */
+    0x81, 0x01,             /*   INPUT (Const,Array,Abs) */
+    0x75, 0x08,             /*   REPORT_SIZE (8) */
+    0x95, 0x01,             /*   REPORT_COUNT (1)        battery percent byte */
+    0x15, 0x00,             /*   LOGICAL_MINIMUM (0) */
+    0x26, 0xff, 0x00,       /*   LOGICAL_MAXIMUM (255) */
+    0x09, 0x65,             /*   USAGE (AbsoluteStateOfCharge) */
+    0x81, 0x02,             /*   INPUT (Data,Var,Abs) */
+    0xc0,                   /* END_COLLECTION */
+};
+
+static const USBDescIface desc_iface_apple_magic_kbd = {
+    .bInterfaceNumber              = 0,
+    .bNumEndpoints                 = 1,
+    .bInterfaceClass               = USB_CLASS_HID,
+    .bInterfaceSubClass            = 0x00,        /* NOT boot — vendor */
+    .bInterfaceProtocol            = 0x00,        /* NOT keyboard — vendor */
+    .iInterface                    = STR_AMK_INTERFACE,
+    .ndesc                         = 1,
+    .descs = (USBDescOther[]) {
+        {
+            /* HID descriptor */
+            .data = (uint8_t[]) {
+                0x09,                            /* bLength */
+                USB_DT_HID,                      /* bDescriptorType */
+                0x11, 0x01,                      /* bcdHID 1.11 */
+                0x00,                            /* bCountryCode */
+                0x01,                            /* bNumDescriptors */
+                USB_DT_REPORT,                   /* bDescriptorType: Report */
+                sizeof(apple_magic_kbd_hid_report_descriptor) & 0xff,
+                sizeof(apple_magic_kbd_hid_report_descriptor) >> 8,
+            },
+        },
+    },
+    .eps = (USBDescEndpoint[]) {
+        {
+            .bEndpointAddress      = USB_DIR_IN | 0x01,
+            .bmAttributes          = USB_ENDPOINT_XFER_INT,
+            .wMaxPacketSize        = 8,
+            .bInterval             = 7, /* 2 ^ (8-1) * 125 us = 8 ms; matches real */
+        },
+    },
+};
+
+static const USBDescDevice desc_device_apple_magic_kbd = {
+    .bcdUSB                        = 0x0200,
+    .bMaxPacketSize0               = 64,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 1,
+            .bConfigurationValue   = 1,
+            .iConfiguration        = STR_AMK_PRODUCT,
+            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
+            .bMaxPower             = 250, /* 500 mA — matches real */
+            .nif                   = 1,
+            .ifs                   = &desc_iface_apple_magic_kbd,
+        },
+    },
+};
+
+static const USBDesc desc_apple_magic_kbd = {
+    .id = {
+        .idVendor          = 0x05ac,                   /* Apple Inc. */
+        .idProduct         = 0x026c,                   /* Magic Keyboard with NumPad */
+        .bcdDevice         = 0x0870,
+        .iManufacturer     = STR_AMK_MFR,
+        .iProduct          = STR_AMK_PRODUCT,
+        .iSerialNumber     = STR_AMK_SERIAL,
+    },
+    .high = &desc_device_apple_magic_kbd,
+    .str  = desc_strings_amk,
+};
+
+static void usb_apple_magic_kbd_realize(USBDevice *dev, Error **errp)
+{
+    dev->usb_desc = &desc_apple_magic_kbd;
+    usb_desc_create_serial(dev);
+    usb_desc_init(dev);
+}
+
+static void usb_apple_magic_kbd_handle_reset(USBDevice *dev)
+{
+    /* Phase 0: nothing to reset (no input state yet). */
+}
+
+static void usb_apple_magic_kbd_handle_control(USBDevice *dev, USBPacket *p,
+                                              int request, int value,
+                                              int index, int length,
+                                              uint8_t *data)
+{
+    int ret;
+
+    ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
+    if (ret >= 0) {
+        return;
+    }
+
+    switch (request) {
+    case InterfaceRequest | USB_REQ_GET_DESCRIPTOR:
+        if ((value >> 8) == 0x22) {
+            /* GET_DESCRIPTOR(REPORT) — return Apple vendor HID descriptor. */
+            uint16_t rd_len = sizeof(apple_magic_kbd_hid_report_descriptor);
+            uint16_t copy = length < rd_len ? length : rd_len;
+            memcpy(data, apple_magic_kbd_hid_report_descriptor, copy);
+            p->actual_length = copy;
+            return;
+        }
+        break;
+    case HID_GET_IDLE:
+        data[0] = 0;
+        p->actual_length = 1;
+        return;
+    case HID_SET_IDLE:
+        return;
+    case HID_GET_PROTOCOL:
+        data[0] = 1; /* report protocol */
+        p->actual_length = 1;
+        return;
+    case HID_SET_PROTOCOL:
+        return;
+    case HID_GET_REPORT:
+    case HID_SET_REPORT:
+        /* Phase 0: stall — no reports flowing yet. */
+        break;
+    }
+
+    p->status = USB_RET_STALL;
+}
+
+static void usb_apple_magic_kbd_handle_data(USBDevice *dev, USBPacket *p)
+{
+    /*
+     * Phase 0: no input data. NAK the IN endpoint poll so the host
+     * keeps polling without erroring. Once Phase 1 lands we'll fill
+     * data with an Apple-encoded report and set p->actual_length.
+     */
+    if (p->pid == USB_TOKEN_IN && p->ep->nr == 1) {
+        p->status = USB_RET_NAK;
+        return;
+    }
+    p->status = USB_RET_STALL;
+}
+
+static void usb_apple_magic_kbd_unrealize(USBDevice *dev)
+{
+    /* Phase 0: nothing to free. */
+}
+
+static void usb_apple_magic_kbd_class_initfn(ObjectClass *klass,
+                                            const void *data)
+{
+    DeviceClass    *dc = DEVICE_CLASS(klass);
+    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+
+    uc->realize        = usb_apple_magic_kbd_realize;
+    uc->product_desc   = "Magic Keyboard with Numeric Keypad";
+    uc->usb_desc       = &desc_apple_magic_kbd;
+    uc->handle_reset   = usb_apple_magic_kbd_handle_reset;
+    uc->handle_control = usb_apple_magic_kbd_handle_control;
+    uc->handle_data    = usb_apple_magic_kbd_handle_data;
+    uc->unrealize      = usb_apple_magic_kbd_unrealize;
+    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
+    dc->desc           = "Apple Magic Keyboard with Numeric Keypad "
+                         "(USB-mode emulator, vendor HID protocol)";
+}
+
+static const TypeInfo usb_apple_magic_kbd_info = {
+    .name          = "apple-magic-keyboard",
+    .parent        = TYPE_USB_DEVICE,
+    .instance_size = sizeof(USBDevice),
+    .class_init    = usb_apple_magic_kbd_class_initfn,
+};
+
 static void usb_hid_register_types(void)
 {
     type_register_static(&usb_hid_type_info);
@@ -1179,6 +1437,7 @@ static void usb_hid_register_types(void)
     type_register_static(&usb_apple_kbd_info);
     type_register_static(&usb_apple_mouse_info);
     type_register_static(&usb_apple_tablet_info);
+    type_register_static(&usb_apple_magic_kbd_info);
 }
 
 type_init(usb_hid_register_types)
