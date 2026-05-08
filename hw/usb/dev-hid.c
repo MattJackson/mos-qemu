@@ -1492,8 +1492,16 @@ static void usb_apple_magic_kbd_handle_control(USBDevice *dev, USBPacket *p,
     USBAppleMagicKbdState *s = USB_APPLE_MAGIC_KBD(dev);
     int ret;
 
+    /* DEBUG: trace every control transfer. Remove before upstream. */
+    fprintf(stderr,
+            "[apple-magic-kbd] CTL req=0x%04x val=0x%04x idx=%d len=%d\n",
+            request, value, index, length);
+
     ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
     if (ret >= 0) {
+        fprintf(stderr,
+                "[apple-magic-kbd]     handled by usb_desc, actual_len=%u\n",
+                p->actual_length);
         return;
     }
 
@@ -1601,6 +1609,9 @@ static void usb_apple_magic_kbd_handle_control(USBDevice *dev, USBPacket *p,
         return;
     }
 
+    /* DEBUG: stall fall-through. Remove before upstream. */
+    fprintf(stderr,
+            "[apple-magic-kbd]     STALL (unhandled CTL)\n");
     p->status = USB_RET_STALL;
 }
 
