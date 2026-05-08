@@ -1921,6 +1921,14 @@ typedef struct USBAppleMagicTabletState {
     bool     button_left;
     bool     pending_event;   /* any change since last sync */
 
+    /* Last seen absolute pointer position for ABS->REL delta conversion.
+     * VNC / SPICE / SDL sources send ABS events (absolute screen coords
+     * normalized to 0..32767). Real Magic Trackpad reports REL deltas
+     * on the wire, so we keep the device's wire format relative-only
+     * and convert ABS->REL here. -1 means "no prior position seen". */
+    int32_t  last_abs_x;
+    int32_t  last_abs_y;
+
     /* Current surface state (sticky between syncs). */
     uint8_t  surface_state;
 
@@ -2055,6 +2063,35 @@ static void amt_input_event(DeviceState *dev, QemuConsole *src,
         s->pending_event = true;
         break;
     }
+    case INPUT_EVENT_KIND_ABS: {
+        /*
+         * VNC / SPICE / SDL deliver pointer motion as INPUT_EVENT_KIND_ABS
+         * (axis value normalized to 0..0x7fff per QEMU input subsystem
+         * convention). Convert to REL deltas relative to the previous
+         * absolute position so the wire format stays the real-device
+         * boot-mouse-style int8 dX/dY frame.
+         *
+         * Scale 0..32767 -> 0..1920 (X) / 0..1080 (Y) so a full-screen
+         * pixel delta maps to a sane int8. amt_emit_pointer_report
+         * clamps with amt_clamp_i8 to ±127 if the delta exceeds that.
+         */
+        InputMoveEvent *move = evt->u.abs.data;
+        if (move->axis == INPUT_AXIS_X) {
+            int32_t scaled = (move->value * 1920) / 0x7fff;
+            if (s->last_abs_x >= 0) {
+                s->pending_dx += scaled - s->last_abs_x;
+            }
+            s->last_abs_x = scaled;
+        } else if (move->axis == INPUT_AXIS_Y) {
+            int32_t scaled = (move->value * 1080) / 0x7fff;
+            if (s->last_abs_y >= 0) {
+                s->pending_dy += scaled - s->last_abs_y;
+            }
+            s->last_abs_y = scaled;
+        }
+        s->pending_event = true;
+        break;
+    }
     case INPUT_EVENT_KIND_BTN: {
         InputBtnEvent *btn = evt->u.btn.data;
         if (btn->button == INPUT_BUTTON_LEFT) {
@@ -2090,7 +2127,13 @@ static void amt_input_sync(DeviceState *dev)
 
 static QemuInputHandler amt_input_handler = {
     .name  = "Apple Magic Trackpad",
-    .mask  = INPUT_EVENT_MASK_REL | INPUT_EVENT_MASK_BTN,
+    /*
+     * Accept both REL and ABS pointer events. SDL/SPICE/HMP sendkey
+     * tend to send REL; VNC sends ABS. amt_input_event maps both onto
+     * the device's int8 dX/dY wire format.
+     */
+    .mask  = INPUT_EVENT_MASK_REL | INPUT_EVENT_MASK_ABS |
+             INPUT_EVENT_MASK_BTN,
     .event = amt_input_event,
     .sync  = amt_input_sync,
 };
@@ -2109,6 +2152,8 @@ static void usb_apple_magic_tablet_realize(USBDevice *dev, Error **errp)
     s->pending_dx = 0;
     s->pending_dy = 0;
     s->button_left = false;
+    s->last_abs_x = -1;       /* "no prior ABS event" sentinel */
+    s->last_abs_y = -1;
     s->pending_event = false;
 
     s->heartbeat_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
