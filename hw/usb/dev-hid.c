@@ -919,8 +919,24 @@ static const TypeInfo usb_keyboard_info = {
  *   bytes 3..9 — up to 7 simultaneous HID Usage codes, 0 in unused slots
  */
 #define AMK_BOOT_REPORT_ID    0x01
+/*
+ * Boot keyboard input report (10 bytes total — byte-for-byte the
+ * Apple Magic Keyboard format captured 2026-05-08):
+ *   byte 0: report ID (0x01)
+ *   byte 1: modifier byte (8 bits, HID Usages 0xE0..0xE7)
+ *   byte 2: reserved (always 0)
+ *   bytes 3..8: 6 keycode slots (HID Usage codes, 0 in unused slots)
+ *   byte 9: bit0 = Eject (Consumer Page), bits1..7 = vendor 0xff00
+ *           Usage 0x03 (always 0 for our emulator).
+ *
+ * NOTE: real Apple boot keyboard convention is 6 keycode slots, not
+ * the 7 some older docs describe. Apple's `AppleHIDKeyboardEventDriverV2`
+ * match dictionary depends on this exact layout — using 7 slots makes
+ * the driver decline to bind, which leaves the boot interface's
+ * IOHIDInterface unclaimed and 60s busy-times out on installed macOS.
+ */
 #define AMK_BOOT_REPORT_LEN   10
-#define AMK_BOOT_NUM_KEYS     7
+#define AMK_BOOT_NUM_KEYS     6
 
 typedef struct USBAppleMagicKbdState {
     USBDevice                  dev;
@@ -948,7 +964,7 @@ static const USBDescStrings desc_strings_amk = {
     [STR_AMK_PRODUCT]        = "Magic Keyboard with Numeric Keypad",
     [STR_AMK_SERIAL]         = "F0T924300PCJKNCAS",
     [STR_AMK_INTERFACE]      = "Device Management",
-    [STR_AMK_INTERFACE_BOOT] = "Boot Keyboard",
+    [STR_AMK_INTERFACE_BOOT] = "Keyboard / Boot",
 };
 
 /*
@@ -1025,44 +1041,63 @@ static const uint8_t apple_magic_kbd_hid_report_descriptor[] = {
  * Real Magic Keyboards expose a similar boot-keyboard interface
  * alongside the vendor (UsagePage 0xff00) interface.
  */
+/*
+ * Boot keyboard report descriptor — byte-for-byte the real Apple
+ * Magic Keyboard with Numeric Keypad report descriptor on Interface 1
+ * (IOReg "Keyboard / Boot@1"), captured 2026-05-08 from a real
+ * keyboard plugged into a Mac running macOS 15.x. Source:
+ * paravirt-re/library/apple-magic-hid/captures/usb-magic/
+ * 04-ioreg-usbhostdevice.txt.
+ *
+ * The descriptor declares FOUR application collections:
+ *   App 1, Report 0x01 — boot keyboard (mod+reserved+6 keys),
+ *                         Consumer eject (1 bit), Vendor 0xff00 (7 bits)
+ *   App 2, Report 0x52 — consumer multimedia keys (mute, vol, etc.)
+ *   App 3, Report 0x09 — generic desktop control (system on/off etc.)
+ *   App 4, Report 0x3f — vendor 0xff00 64-byte feature report
+ *
+ * Our emulator only generates Report 0x01 (typing). The other three
+ * collections must be DECLARED in the descriptor for AppleUSBTopCase
+ * HIDDriver and AppleHIDKeyboardEventDriverV2 to match-dictionary
+ * accept the device — we don't have to actually emit reports for
+ * them.
+ *
+ * Using a generic single-collection boot keyboard descriptor (which
+ * we did pre-2026-05-08) makes AppleHIDKeyboardEventDriverV2 decline
+ * to bind, which leaves the boot iface IOHIDInterface unclaimed and
+ * 60s busy-times out on installed macOS.
+ */
 static const uint8_t apple_magic_kbd_boot_hid_report_descriptor[] = {
-    0x05, 0x07,             /* Usage Page (Keyboard/Keypad) */
-    0x09, 0x06,             /* Usage (Keyboard) */
-    0xa1, 0x01,             /* Collection (Application) */
-    0x85, AMK_BOOT_REPORT_ID, /*   Report ID (1) */
-    /* 8 modifier bits (0xE0..0xE7) */
-    0x05, 0x07,             /*   Usage Page (Keyboard/Keypad) */
-    0x19, 0xe0,             /*   Usage Minimum (224) */
-    0x29, 0xe7,             /*   Usage Maximum (231) */
-    0x15, 0x00,             /*   Logical Minimum (0) */
-    0x25, 0x01,             /*   Logical Maximum (1) */
-    0x75, 0x01,             /*   Report Size (1) */
-    0x95, 0x08,             /*   Report Count (8) */
-    0x81, 0x02,             /*   Input (Data, Variable, Absolute) */
-    /* reserved byte */
-    0x95, 0x01,             /*   Report Count (1) */
-    0x75, 0x08,             /*   Report Size (8) */
-    0x81, 0x01,             /*   Input (Constant) */
-    /* 5 LED output bits + 3 padding */
-    0x95, 0x05,             /*   Report Count (5) */
-    0x75, 0x01,             /*   Report Size (1) */
-    0x05, 0x08,             /*   Usage Page (LEDs) */
-    0x19, 0x01,             /*   Usage Minimum (1) */
-    0x29, 0x05,             /*   Usage Maximum (5) */
-    0x91, 0x02,             /*   Output (Data, Variable, Absolute) */
-    0x95, 0x01,             /*   Report Count (1) */
-    0x75, 0x03,             /*   Report Size (3) */
-    0x91, 0x01,             /*   Output (Constant) */
-    /* 7 keycode slots (8 bits each) */
-    0x95, AMK_BOOT_NUM_KEYS, /*   Report Count (7) */
-    0x75, 0x08,             /*   Report Size (8) */
-    0x15, 0x00,             /*   Logical Minimum (0) */
-    0x26, 0xff, 0x00,       /*   Logical Maximum (255) */
-    0x05, 0x07,             /*   Usage Page (Keyboard/Keypad) */
-    0x19, 0x00,             /*   Usage Minimum (0) */
-    0x29, 0xff,             /*   Usage Maximum (255) */
-    0x81, 0x00,             /*   Input (Data, Array) */
-    0xc0,                   /* End Collection */
+    /* App 1: boot keyboard + Consumer eject + Vendor 0xff (Report 0x01) */
+    0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01,
+    0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00,
+    0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+    0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x05,
+    0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05,
+    0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91, 0x01,
+    0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x26, 0xff,
+    0x00, 0x05, 0x07, 0x19, 0x00, 0x29, 0xff, 0x81,
+    0x00, 0x05, 0x0c, 0x75, 0x01, 0x95, 0x01, 0x09,
+    0xb8, 0x15, 0x00, 0x25, 0x01, 0x81, 0x02, 0x05,
+    0xff, 0x09, 0x03, 0x75, 0x07, 0x95, 0x01, 0x81,
+    0x02, 0xc0,
+    /* App 2: Consumer multimedia keys (Report 0x52) +
+     *        system control feature report (Report 0x09)
+     * One Application Collection containing two Report IDs. */
+    0x05, 0x0c, 0x09, 0x01, 0xa1, 0x01,
+    0x85, 0x52, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
+    0x95, 0x01, 0x09, 0xcd, 0x81, 0x02, 0x09, 0xb3,
+    0x81, 0x02, 0x09, 0xb4, 0x81, 0x02, 0x09, 0xb5,
+    0x81, 0x02, 0x09, 0xb6, 0x81, 0x02, 0x81, 0x01,
+    0x81, 0x01, 0x81, 0x01, 0x85, 0x09, 0x15, 0x00,
+    0x25, 0x01, 0x75, 0x08, 0x95, 0x01, 0x06, 0x01,
+    0xff, 0x09, 0x0b, 0xb1, 0x02, 0x75, 0x08, 0x95,
+    0x02, 0xb1, 0x01, 0xc0,
+    /* App 3: Vendor 0xff00 64-byte feature blob (Report 0x3f) */
+    0x06, 0x00, 0xff, 0x09,
+    0x06, 0xa1, 0x01, 0x06, 0x00, 0xff, 0x09, 0x06,
+    0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95,
+    0x40, 0x85, 0x3f, 0x81, 0x22, 0xc0,
 };
 
 static const USBDescIface desc_iface_apple_magic_kbd[] = {
@@ -1296,11 +1331,15 @@ static const uint8_t apple_magic_kbd_qcode_to_hid_usage[Q_KEY_CODE__MAX] = {
 };
 
 /*
- * Pack the live boot-keyboard state into a 10-byte report payload.
+ * Pack the live boot-keyboard state into a 10-byte report payload —
+ * matches real Apple Magic Keyboard Report 0x01 layout (boot keyboard
+ * + Consumer Eject + Vendor 0xff Usage 0x03):
  *   buf[0]    = report ID (0x01)
- *   buf[1]    = modifier byte
+ *   buf[1]    = modifier byte (HID Usages 0xE0..0xE7)
  *   buf[2]    = reserved (0)
- *   buf[3..9] = 7 keycode slots
+ *   buf[3..8] = 6 keycode slots (HID Usage codes)
+ *   buf[9]    = bit0 Consumer Eject + bits1..7 Vendor 0xff Usage 0x03
+ *              (always 0 — emulator does not generate eject or vendor)
  */
 static void apple_magic_kbd_pack_boot_report(USBAppleMagicKbdState *s,
                                              uint8_t buf[AMK_BOOT_REPORT_LEN])
@@ -1308,7 +1347,8 @@ static void apple_magic_kbd_pack_boot_report(USBAppleMagicKbdState *s,
     buf[0] = AMK_BOOT_REPORT_ID;
     buf[1] = s->boot_modifiers;
     buf[2] = 0;
-    memcpy(&buf[3], s->boot_keys, AMK_BOOT_NUM_KEYS);
+    memcpy(&buf[3], s->boot_keys, AMK_BOOT_NUM_KEYS); /* 6 keycodes */
+    buf[9] = 0;                                       /* eject + vendor */
 }
 
 /* Update s->boot_modifiers / s->boot_keys for one HID Usage, then mark
