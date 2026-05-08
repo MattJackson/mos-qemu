@@ -868,44 +868,44 @@ static const TypeInfo usb_keyboard_info = {
  * apple-magic-keyboard
  * --------------------
  *
- * Mimics the real Apple Magic Keyboard with Numeric Keypad in USB
- * mode (idVendor 0x05ac, idProduct 0x026c). Ships Apple's
- * vendor-defined HID protocol on UsagePage 0xff00 — the protocol
- * AppleUSBTopCaseHIDDriver actually probes for. The descriptors and
- * HID report descriptor here are byte-identical to those captured
- * from a real Mac with a Magic Keyboard plugged in via USB cable,
- * documented in
- * mos/paravirt-re/library/apple-magic-hid/.
+ * USB-mode emulator for the Apple Magic Keyboard with Numeric Keypad
+ * (idVendor 0x05ac, idProduct 0x026c). Carries Apple's vendor-defined
+ * HID protocol on UsagePage 0xff00 alongside a standard HID Boot
+ * Keyboard interface; the descriptors and HID report descriptors are
+ * byte-identical to a real Magic Keyboard captured in USB-cable mode.
  *
- * Replaces the previous descriptor-only apple-kbd / apple-mouse /
- * apple-tablet wrappers (Package D, withdrawn 2026-05-07) which
- * incorrectly used boot-protocol HID instead of Apple's vendor
- * protocol and broke macOS recovery's HID stack.
+ * Two HID interfaces:
  *
- * Phase 0 (closed): descriptors only — Interface 0 (vendor) alive,
- * no input reports sent. Verified AppleUSBTopCaseHIDDriver binds
- * (chain: AppleUSBTopCaseHIDDriver → AppleDeviceManagementHIDEvent
- * Service → AppleUserHIDEventDriver), removing the "Power On
- * Bluetooth Keyboard" UI in macOS recovery.
+ *   Interface 0 — Apple-vendor HID (UsagePage 0xff00). Carries three
+ *     vendor input report IDs that the macOS Apple HID driver chain
+ *     (AppleUSBTopCaseHIDDriver → AppleDeviceManagementHIDEventService
+ *     → AppleUserHIDEventDriver) probes against:
  *
- * Phase 1 (THIS): add a SECOND HID interface (#1) implementing the
- * standard USB HID boot keyboard protocol (UsagePage 0x07, Report
- * ID 0x01, 10-byte input report — modifier byte + 7-slot keycode
- * array). Real Magic Keyboards present this iface as well. We wire
- * it to QEMU's input subsystem so VNC/SPICE keystrokes reach the
- * macOS guest as standard HID Boot Keyboard events. Interface 0
- * (vendor 0xff00) remains unchanged so the AppleUSBTopCaseHIDDriver
- * binding from Phase 0 keeps working.
+ *       0xe0  4 bytes  vendor keyboard event
+ *       0x9a  1 byte   modifier-state change / short signal
+ *       0x90  2 bytes  power flags + battery percent
  *
- * Phase 2+ (future): translate VNC keystrokes into Apple's report
- * 0xe0 / 0x9a vendor-encoded format on Interface 0 IN endpoint
- * (so the AppleUSBTopCase stack receives keystrokes as well).
+ *     A 1 Hz 0x90 heartbeat keeps the macOS userspace HID watchdog
+ *     considering the device alive. Real device firmware emits the
+ *     same heartbeat regardless of activity.
+ *
+ *   Interface 1 — standard HID Boot Keyboard (UsagePage 0x07,
+ *     bInterfaceSubClass 1, bInterfaceProtocol 1). Emits the standard
+ *     10-byte boot-keyboard input report (modifier byte + 7 keycode
+ *     slots) on EP2 IN. Wired to QEMU's input subsystem via
+ *     qemu_input_handler_register; any RFB / SPICE / SDL / HMP
+ *     `sendkey` source drives it.
+ *
+ * The vendor-encoded keystroke format on Interface 0 (where reports
+ * 0xe0 / 0x9a would carry typing data) is not generated here; macOS's
+ * boot-keyboard claim path drives input via Interface 1, which is
+ * sufficient for typing and modifier handling.
  */
 
 /*
  * USB endpoint numbers within the apple-magic-keyboard device.
- * EP1 IN = vendor-defined HID reports (Interface 0). Phase 0 only —
- * still NAKed. EP2 IN = boot keyboard reports (Interface 1, Phase 1).
+ * EP1 IN = vendor-defined HID reports (Interface 0).
+ * EP2 IN = boot keyboard reports (Interface 1).
  */
 #define AMK_EP_VENDOR_IN  1
 #define AMK_EP_BOOT_IN    2
@@ -1010,7 +1010,7 @@ static const uint8_t apple_magic_kbd_hid_report_descriptor[] = {
 };
 
 /*
- * Phase 1: Interface 1 — standard USB HID Boot Keyboard.
+ * Interface 1 — standard USB HID Boot Keyboard.
  *
  * UsagePage 0x07 (Keyboard/Keypad), one Application collection with
  * Report ID 0x01:
@@ -1067,7 +1067,7 @@ static const uint8_t apple_magic_kbd_boot_hid_report_descriptor[] = {
 
 static const USBDescIface desc_iface_apple_magic_kbd[] = {
     {
-        /* Interface 0: vendor HID (Phase 0). */
+        /* Interface 0: Apple-vendor HID. */
         .bInterfaceNumber              = 0,
         .bNumEndpoints                 = 1,
         .bInterfaceClass               = USB_CLASS_HID,
@@ -1100,7 +1100,7 @@ static const USBDescIface desc_iface_apple_magic_kbd[] = {
         },
     },
     {
-        /* Interface 1: boot keyboard (Phase 1). */
+        /* Interface 1: standard HID boot keyboard. */
         .bInterfaceNumber              = 1,
         .bNumEndpoints                 = 1,
         .bInterfaceClass               = USB_CLASS_HID,
@@ -1348,9 +1348,9 @@ static bool apple_magic_kbd_apply_usage(USBAppleMagicKbdState *s,
             }
         }
         /* Roll-over — slots full. Per HID spec, every slot should be
-         * 0x01 (ErrorRollOver). For Phase 1 simplicity we just drop;
-         * VNC / single-user input isn't going to produce 8+ chord keys
-         * in normal use. */
+         * 0x01 (ErrorRollOver). For simplicity we just drop; VNC /
+         * single-user input isn't going to produce 8+ chord keys in
+         * normal use. */
         return false;
     } else {
         for (i = 0; i < AMK_BOOT_NUM_KEYS; i++) {
@@ -1491,9 +1491,9 @@ static void usb_apple_magic_kbd_handle_control(USBDevice *dev, USBPacket *p,
          *
          * Interface 0 (vendor): blanket-ACK with zero-filled payload of
          * the declared report size. Stalling these would send
-         * AppleUSBTopCaseHIDDriver into a tight retry loop on match-
-         * probe (host wedge of 2026-05-07). Match the per-Report-ID
-         * sizes declared in the vendor HID Report Descriptor:
+         * AppleUSBTopCaseHIDDriver into a tight retry loop on
+         * match-probe. Match the per-Report-ID sizes declared in the
+         * vendor HID Report Descriptor:
          *   0xe0 → 4 bytes  (input only, but driver may probe Feature)
          *   0x9a → 1 byte
          *   0x90 → 2 bytes  (AC/charge bits + battery byte)
@@ -1541,10 +1541,10 @@ static void usb_apple_magic_kbd_handle_control(USBDevice *dev, USBPacket *p,
     }
     case HID_SET_REPORT:
         /*
-         * Interface 0 (vendor): silently accept SET_REPORT writes
-         * (e.g. raw-multi-touch enable on the trackpad). Phase 2+:
-         * parse vendor SET_REPORTs (0x02, 0xF1) per Linux
-         * magicmouse_enable_multitouch().
+         * Interface 0 (vendor): silently accept SET_REPORT writes.
+         * The vendor multitouch-enable SET_REPORT (0x02, 0xF1, per
+         * Linux's magicmouse_enable_multitouch) is acknowledged but
+         * not yet acted on; the device stays on the boot face.
          *
          * Interface 1 (boot keyboard): ACK SET_REPORT (LED state).
          * We don't drive any host-visible LEDs yet but must not stall.
@@ -1567,9 +1567,10 @@ static void usb_apple_magic_kbd_handle_data(USBDevice *dev, USBPacket *p)
     switch (p->ep->nr) {
     case AMK_EP_VENDOR_IN:
         /*
-         * Phase 0 still: vendor IN endpoint has no input data. NAK so
-         * the host keeps polling without erroring. Phase 2+ will fill
-         * with Apple-encoded reports.
+         * Vendor IN endpoint carries the 1 Hz 0x90 heartbeat queued
+         * from the heartbeat timer. NAK when nothing is pending so
+         * the host keeps polling without erroring; the typing pipe
+         * is on Interface 1's boot-keyboard endpoint.
          */
         p->status = USB_RET_NAK;
         return;
@@ -1635,10 +1636,9 @@ static const TypeInfo usb_apple_magic_kbd_info = {
  * apple-magic-tablet
  * ------------------
  *
- * Mimics the real Apple Magic Trackpad in USB mode (idVendor 0x05ac,
- * idProduct 0x0265). Wire format decoded from a real device on
- * 2026-05-07; see
- * mos/paravirt-re/library/apple-magic-hid/captures/trackpad-input-reports-2026-05-07.txt.
+ * USB-mode emulator for the Apple Magic Trackpad 2 (idVendor 0x05ac,
+ * idProduct 0x0265). Descriptors and HID report descriptors are
+ * byte-identical to a real device captured in USB-cable mode.
  *
  * Two input reports:
  *   RID 0x01  3 bytes  01 00 00          — 1Hz device-firmware heartbeat
@@ -2143,8 +2143,8 @@ static void usb_apple_magic_tablet_handle_control(USBDevice *dev, USBPacket *p,
         /*
          * Silently accept SET_REPORT writes. macOS sends a vendor
          * "enable mode 4" SET_REPORT after enumeration to switch the
-         * device into multitouch mode; v1 stays on the boot-mouse
-         * face regardless. Phase 2 will parse + react.
+         * device into multitouch mode; this emulator stays on the
+         * boot-mouse face regardless and does not act on it yet.
          */
         return;
     }
