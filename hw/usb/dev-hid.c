@@ -1422,6 +1422,7 @@ static const QemuInputHandler apple_magic_kbd_input_handler = {
 static void apple_magic_kbd_heartbeat_cb(void *opaque)
 {
     USBAppleMagicKbdState *s = opaque;
+    static unsigned tick;
 
     /*
      * Mark a heartbeat queued and wake the vendor IN endpoint so the
@@ -1432,6 +1433,11 @@ static void apple_magic_kbd_heartbeat_cb(void *opaque)
     if (s->vendor_intr) {
         usb_wakeup(s->vendor_intr, 0);
     }
+    /* DEBUG: temporary instrumentation to confirm timer fires + endpoint
+     * is wired. Remove before upstream submission. */
+    fprintf(stderr,
+            "[apple-magic-kbd] heartbeat tick=%u vendor_intr=%p pending=1\n",
+            ++tick, s->vendor_intr);
     timer_mod(s->heartbeat_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + AMK_HEARTBEAT_NS);
 }
@@ -1622,6 +1628,7 @@ static void usb_apple_magic_kbd_handle_data(USBDevice *dev, USBPacket *p)
          *   byte 2: battery percent (0..255), 0x64 = 100%.
          */
         static const uint8_t heartbeat[3] = { 0x90, 0x03, 0x64 };
+        static unsigned dq_tick;
         size_t copy;
         if (!s->heartbeat_pending) {
             p->status = USB_RET_NAK;
@@ -1631,6 +1638,10 @@ static void usb_apple_magic_kbd_handle_data(USBDevice *dev, USBPacket *p)
         copy = p->iov.size < sizeof(heartbeat)
              ? p->iov.size : sizeof(heartbeat);
         usb_packet_copy(p, (uint8_t *)heartbeat, copy);
+        /* DEBUG: temporary instrumentation. Remove before upstream. */
+        fprintf(stderr,
+                "[apple-magic-kbd] EP1 IN dequeue tick=%u len=%zu\n",
+                ++dq_tick, copy);
         return;
     }
     case AMK_EP_BOOT_IN: {
