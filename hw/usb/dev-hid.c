@@ -1706,37 +1706,35 @@ static const TypeInfo usb_apple_magic_kbd_info = {
  *
  * USB-mode emulator for the Apple Magic Trackpad 2 (idVendor 0x05ac,
  * idProduct 0x0265). Descriptors and HID report descriptors are
- * byte-identical to a real device captured in USB-cable mode.
+ * byte-identical to a real device captured in USB-cable mode (two
+ * HID interfaces: vendor "Device Management" + boot "Trackpad / Boot",
+ * matching the real device's IOReg layout).
  *
- * Two input reports:
- *   RID 0x01  3 bytes  01 00 00          — 1Hz device-firmware heartbeat
- *   RID 0x02  8 bytes  02 BB DX DY EX EY 00 SS
- *                                         — boot-mouse-style pointer:
- *     BB = button     (bit 0 = left click)
+ * Boot-interface input reports:
+ *   RID 0x02  8 bytes  02 BB DX DY 00 00 00 00
+ *                                         — boot-mouse pointer frame:
+ *     BB = button     (bit 0 = left click, bits 1-2 right/middle)
  *     DX = int8 dX    signed per-frame delta (~66Hz cadence)
  *     DY = int8 dY    signed per-frame delta
- *     EX = high byte of dX (always 0 in capture; reserved for >±127)
- *     EY = high byte of dY (always 0 in capture)
- *     [6] = reserved (0)
- *     SS = surface state — 0x03 touching, 0x02 lifted
+ *     [4..7] = reserved (0)
  *
  * This is the "USB boot mouse" face of the trackpad. The vendor
- * multitouch protocol (per-finger absolute positions) is gated behind
- * a vendor SET_REPORT macOS sends after enumeration. v1 emulates only
- * the boot face: cursor motion + left click, which is enough for
- * macOS to bind AppleUSBTopCaseHIDDriver and present a real Apple
+ * multitouch protocol (per-finger absolute positions, RID 0x3f /
+ * RID 0x44) is gated behind a vendor SET_REPORT macOS sends after
+ * enumeration. v1 emulates only the boot face: cursor motion + left
+ * click, which is enough for macOS to bind AppleUSBTopCaseHIDDriver
+ * + AppleMultitouchTrackpadHIDEventDriver and present a real Apple
  * pointing device (not the generic usb-tablet that breaks recovery).
  *
  * QEMU input subsystem wiring:
- *   - Registers a QemuInputHandler accepting REL motion + BTN events.
- *   - Accumulates dx/dy deltas across input frames; flushes a
- *     Report 0x02 frame from the .sync callback (one frame per VNC
- *     pointer event batch — matches the ~66Hz cadence of the real
- *     device).
- *   - Tracks surface_state: any motion or button event marks 0x03
- *     (touching); a 30ms idle timer flips to 0x02 (lifted) and
- *     emits a final lift frame.
- *   - Independent 1Hz timer always emits 0x01 0x00 0x00 (RID 0x01).
+ *   - Registers a QemuInputHandler accepting REL motion + ABS motion
+ *     + BTN events. ABS events (from VNC) are converted to REL via a
+ *     last_abs_x/y delta tracker, since the boot-mouse report only
+ *     carries int8 dX/dY.
+ *   - Accumulates dx/dy across input frames; flushes one Report 0x02
+ *     frame from the .sync callback per input batch.
+ *   - Independent 1Hz timer emits a battery-status heartbeat on the
+ *     vendor interface (Report 0x52 / 0x90 family).
  */
 
 enum {
@@ -1750,7 +1748,7 @@ static const USBDescStrings desc_strings_amt = {
     [STR_AMT_MFR]       = "Apple Inc.",
     [STR_AMT_PRODUCT]   = "Magic Trackpad",
     [STR_AMT_SERIAL]    = "CC2916600VBJ2XQA5",
-    [STR_AMT_INTERFACE] = "Apple Internal Trackpad",
+    [STR_AMT_INTERFACE] = "Trackpad / Boot",
 };
 
 /*
@@ -1760,66 +1758,66 @@ static const USBDescStrings desc_strings_amt = {
  *   RID 0x01: 2 bytes  (heartbeat payload)
  *   RID 0x02: 7 bytes  (button + dX + dY + EX + EY + reserved + state)
  */
+/*
+ * Trackpad/Boot HID Report Descriptor — byte-for-byte the real Apple
+ * Magic Trackpad 2's Interface 1 descriptor (PID 0x0265), captured
+ * 2026-05-08 from a real device plugged into a Mac. Source:
+ * paravirt-re/library/apple-magic-hid/captures/usb-magic-2/
+ * 04-ioreg-usbhostdevice.txt.
+ *
+ * Three application collections:
+ *
+ *   App 1, Generic Desktop / Mouse (Report 0x02, 8 bytes):
+ *     byte 0: report ID (0x02)
+ *     byte 1: bits 0..2 = Buttons 1..3, bits 3..7 = padding
+ *     byte 2: signed int8 dX (REL)
+ *     byte 3: signed int8 dY (REL)
+ *     bytes 4-7: 4 reserved bytes
+ *
+ *   App 2, Digitizer / Touch Pad (Report 0x3f, 17 bytes):
+ *     16 bytes vendor input frame — declared but not emitted by the
+ *     emulator (multi-touch protocol gated behind a vendor-enable
+ *     SET_REPORT, out of v1 scope).
+ *
+ *   App 3, Vendor 0xff00 (Report 0x44, 1388 bytes):
+ *     1387-byte vendor multi-touch frame — declared but not emitted.
+ *
+ * AppleMultitouchTrackpadHIDEventDriver claims this interface via
+ * Apple PID match and pulls cursor motion from Report 0x02. The other
+ * two collections are declared so its match-dictionary accepts the
+ * descriptor; without them the driver's start path stalls
+ * IOHIDInterface during ::start.
+ */
 static const uint8_t apple_magic_tablet_hid_report_descriptor[] = {
-    0x05, 0x01,             /* USAGE_PAGE (Generic Desktop) */
-    0x09, 0x02,             /* USAGE (Mouse) */
-    0xa1, 0x01,             /* COLLECTION (Application) */
-
-    /* Report 0x01 — vendor heartbeat (2 bytes) */
-    0x85, 0x01,             /*   REPORT_ID (0x01) */
-    0x06, 0x00, 0xff,       /*   USAGE_PAGE (Vendor-defined 0xff00) */
-    0x09, 0x01,             /*   USAGE (vendor 0x01) */
-    0x15, 0x00,             /*   LOGICAL_MINIMUM (0) */
-    0x26, 0xff, 0x00,       /*   LOGICAL_MAXIMUM (255) */
-    0x75, 0x08,             /*   REPORT_SIZE (8) */
-    0x95, 0x02,             /*   REPORT_COUNT (2)              2 vendor bytes */
-    0x81, 0x02,             /*   INPUT (Data,Var,Abs) */
-
-    /* Report 0x02 — boot-mouse pointer (7 bytes payload) */
-    0x05, 0x01,             /*   USAGE_PAGE (Generic Desktop) */
-    0x09, 0x01,             /*   USAGE (Pointer) */
-    0xa1, 0x00,             /*   COLLECTION (Physical) */
-    0x85, 0x02,             /*     REPORT_ID (0x02) */
-    /*   byte 0 (after RID): button + 7 padding */
-    0x05, 0x09,             /*     USAGE_PAGE (Button) */
-    0x19, 0x01,             /*     USAGE_MINIMUM (Button 1) */
-    0x29, 0x01,             /*     USAGE_MAXIMUM (Button 1) */
-    0x15, 0x00,             /*     LOGICAL_MINIMUM (0) */
-    0x25, 0x01,             /*     LOGICAL_MAXIMUM (1) */
-    0x75, 0x01,             /*     REPORT_SIZE (1) */
-    0x95, 0x01,             /*     REPORT_COUNT (1) */
-    0x81, 0x02,             /*     INPUT (Data,Var,Abs) */
-    0x75, 0x07,             /*     REPORT_SIZE (7) */
-    0x95, 0x01,             /*     REPORT_COUNT (1) */
-    0x81, 0x01,             /*     INPUT (Const)                 7-bit pad */
-    /*   bytes 1-2: signed int8 dX, dY */
-    0x05, 0x01,             /*     USAGE_PAGE (Generic Desktop) */
-    0x09, 0x30,             /*     USAGE (X) */
-    0x09, 0x31,             /*     USAGE (Y) */
-    0x15, 0x81,             /*     LOGICAL_MINIMUM (-127) */
-    0x25, 0x7f,             /*     LOGICAL_MAXIMUM (127) */
-    0x75, 0x08,             /*     REPORT_SIZE (8) */
-    0x95, 0x02,             /*     REPORT_COUNT (2) */
-    0x81, 0x06,             /*     INPUT (Data,Var,Rel)          dX, dY */
-    /*   bytes 3-6: vendor reserved (EX, EY, 0, surface_state) */
-    0x06, 0x00, 0xff,       /*     USAGE_PAGE (Vendor-defined 0xff00) */
-    0x09, 0x02,             /*     USAGE (vendor 0x02) */
-    0x15, 0x00,             /*     LOGICAL_MINIMUM (0) */
-    0x26, 0xff, 0x00,       /*     LOGICAL_MAXIMUM (255) */
-    0x75, 0x08,             /*     REPORT_SIZE (8) */
-    0x95, 0x04,             /*     REPORT_COUNT (4)              EX,EY,rsv,SS */
-    0x81, 0x02,             /*     INPUT (Data,Var,Abs) */
-    0xc0,                   /*   END_COLLECTION */
-
-    0xc0,                   /* END_COLLECTION */
+    0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01,
+    0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
+    0x15, 0x00, 0x25, 0x01, 0x85, 0x02, 0x95, 0x03,
+    0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05,
+    0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31,
+    0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x02,
+    0x81, 0x06, 0x95, 0x04, 0x75, 0x08, 0x81, 0x01,
+    0xc0, 0xc0, 0x05, 0x0d, 0x09, 0x05, 0xa1, 0x01,
+    0x06, 0x00, 0xff, 0x09, 0x0c, 0x15, 0x00, 0x26,
+    0xff, 0x00, 0x75, 0x08, 0x95, 0x10, 0x85, 0x3f,
+    0x81, 0x22, 0xc0, 0x06, 0x00, 0xff, 0x09, 0x0c,
+    0xa1, 0x01, 0x06, 0x00, 0xff, 0x09, 0x0c, 0x15,
+    0x00, 0x26, 0xff, 0x00, 0x85, 0x44, 0x75, 0x08,
+    0x96, 0x6b, 0x05, 0x81, 0x00, 0xc0,
 };
 
 static const USBDescIface desc_iface_apple_magic_tablet = {
     .bInterfaceNumber              = 0,
     .bNumEndpoints                 = 1,
     .bInterfaceClass               = USB_CLASS_HID,
-    .bInterfaceSubClass            = 0x00,        /* NOT boot — vendor */
-    .bInterfaceProtocol            = 0x00,
+    /*
+     * Trackpad / Boot interface — boot mouse, mirroring real Apple
+     * Magic Trackpad 2's Interface 1 (PID 0x0265). bSubClass=1
+     * (boot), bProtocol=2 (mouse). AppleMultitouchTrackpadHIDEventDriver
+     * matches on these properties + Apple PID; without them the driver
+     * binds but doesn't pull cursor motion from Report 0x02.
+     */
+    .bInterfaceSubClass            = 0x01,        /* boot */
+    .bInterfaceProtocol            = 0x02,        /* mouse */
     .iInterface                    = STR_AMT_INTERFACE,
     .ndesc                         = 1,
     .descs = (USBDescOther[]) {
@@ -1889,17 +1887,6 @@ static const USBDesc desc_apple_magic_tablet = {
     .str  = desc_strings_amt,
 };
 
-/* Surface-state values for byte 7 of Report 0x02. */
-#define AMT_SURFACE_LIFTED   0x02
-#define AMT_SURFACE_TOUCHING 0x03
-
-/*
- * Idle window after which the surface is considered "lifted". 30 ms
- * matches the real device: a tap leaves ~30-45 ms between the click-up
- * frame (SS=0x03) and the lift frame (SS=0x02). Picked the floor.
- */
-#define AMT_LIFT_TIMEOUT_NS  (30 * SCALE_MS)
-
 /* Heartbeat cadence for Report 0x01 — once per second. */
 #define AMT_HEARTBEAT_NS     (1000 * SCALE_MS)
 
@@ -1929,9 +1916,6 @@ typedef struct USBAppleMagicTabletState {
     int32_t  last_abs_x;
     int32_t  last_abs_y;
 
-    /* Current surface state (sticky between syncs). */
-    uint8_t  surface_state;
-
     /* Ring queue of reports to deliver on the next IN endpoint poll. */
     USBAppleMagicTabletReport queue[AMT_QUEUE_DEPTH];
     unsigned q_head;
@@ -1940,9 +1924,8 @@ typedef struct USBAppleMagicTabletState {
     /* QEMU input handler binding. */
     QemuInputHandlerState *input_handler;
 
-    /* Timers. */
+    /* 1 Hz heartbeat (3-byte 0x01 frame on EP1 IN). */
     QEMUTimer *heartbeat_timer;
-    QEMUTimer *lift_timer;
 } USBAppleMagicTabletState;
 
 #define TYPE_USB_APPLE_MAGIC_TABLET "apple-magic-tablet"
@@ -1989,9 +1972,17 @@ static int8_t amt_clamp_i8(int32_t v)
     return (int8_t)v;
 }
 
-static void amt_emit_pointer_report(USBAppleMagicTabletState *s,
-                                    uint8_t surface_state)
+static void amt_emit_pointer_report(USBAppleMagicTabletState *s)
 {
+    /*
+     * Real Apple Magic Trackpad 2 Report 0x02 wire format
+     * (per IOReg ReportDescriptor capture, 8 bytes):
+     *   byte 0: report ID (0x02)
+     *   byte 1: bits 0..2 = Buttons 1..3, bits 3..7 = padding
+     *   byte 2: signed int8 dX (REL)
+     *   byte 3: signed int8 dY (REL)
+     *   bytes 4-7: 4 reserved bytes (always 0)
+     */
     uint8_t buf[8];
     int8_t dx = amt_clamp_i8(s->pending_dx);
     int8_t dy = amt_clamp_i8(s->pending_dy);
@@ -2000,14 +1991,14 @@ static void amt_emit_pointer_report(USBAppleMagicTabletState *s,
     s->pending_dx -= dx;
     s->pending_dy -= dy;
 
-    buf[0] = 0x02;                       /* report ID */
-    buf[1] = s->button_left ? 0x01 : 0x00;
+    buf[0] = 0x02;
+    buf[1] = s->button_left ? 0x01 : 0x00; /* bit 0 = Button 1 */
     buf[2] = (uint8_t)dx;
     buf[3] = (uint8_t)dy;
-    buf[4] = 0x00;                       /* dX high byte (unused) */
-    buf[5] = 0x00;                       /* dY high byte (unused) */
-    buf[6] = 0x00;                       /* reserved */
-    buf[7] = surface_state;
+    buf[4] = 0x00;
+    buf[5] = 0x00;
+    buf[6] = 0x00;
+    buf[7] = 0x00;
 
     amt_enqueue(s, buf, sizeof(buf));
     usb_wakeup(s->intr, 0);
@@ -2026,24 +2017,6 @@ static void amt_heartbeat_cb(void *opaque)
     amt_emit_heartbeat(s);
     timer_mod(s->heartbeat_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + AMT_HEARTBEAT_NS);
-}
-
-static void amt_lift_cb(void *opaque)
-{
-    USBAppleMagicTabletState *s = opaque;
-
-    if (s->surface_state == AMT_SURFACE_LIFTED) {
-        return;
-    }
-    s->surface_state = AMT_SURFACE_LIFTED;
-    /* Final frame with state=0x02 to signal lift. */
-    amt_emit_pointer_report(s, AMT_SURFACE_LIFTED);
-}
-
-static void amt_arm_lift_timer(USBAppleMagicTabletState *s)
-{
-    timer_mod(s->lift_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + AMT_LIFT_TIMEOUT_NS);
 }
 
 /* QemuInputHandler.event — accumulate per-event state. */
@@ -2118,11 +2091,7 @@ static void amt_input_sync(DeviceState *dev)
         return;
     }
     s->pending_event = false;
-    s->surface_state = AMT_SURFACE_TOUCHING;
-    amt_emit_pointer_report(s, AMT_SURFACE_TOUCHING);
-    /* (Re-)arm the lift timer; if no further events arrive within
-     * AMT_LIFT_TIMEOUT_NS we'll emit a lift frame. */
-    amt_arm_lift_timer(s);
+    amt_emit_pointer_report(s);
 }
 
 static QemuInputHandler amt_input_handler = {
@@ -2146,7 +2115,6 @@ static void usb_apple_magic_tablet_realize(USBDevice *dev, Error **errp)
     usb_desc_init(dev);
     s->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
 
-    s->surface_state = AMT_SURFACE_LIFTED;
     s->q_head = 0;
     s->q_tail = 0;
     s->pending_dx = 0;
@@ -2158,8 +2126,6 @@ static void usb_apple_magic_tablet_realize(USBDevice *dev, Error **errp)
 
     s->heartbeat_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                       amt_heartbeat_cb, s);
-    s->lift_timer      = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                      amt_lift_cb, s);
 
     /* Start the 1Hz heartbeat. The first tick fires 1 s after realize. */
     timer_mod(s->heartbeat_timer,
@@ -2181,10 +2147,6 @@ static void usb_apple_magic_tablet_unrealize(USBDevice *dev)
         timer_free(s->heartbeat_timer);
         s->heartbeat_timer = NULL;
     }
-    if (s->lift_timer) {
-        timer_free(s->lift_timer);
-        s->lift_timer = NULL;
-    }
 }
 
 static void usb_apple_magic_tablet_handle_reset(USBDevice *dev)
@@ -2195,7 +2157,8 @@ static void usb_apple_magic_tablet_handle_reset(USBDevice *dev)
     s->pending_dx = s->pending_dy = 0;
     s->button_left = false;
     s->pending_event = false;
-    s->surface_state = AMT_SURFACE_LIFTED;
+    s->last_abs_x = -1;
+    s->last_abs_y = -1;
 }
 
 static void usb_apple_magic_tablet_handle_control(USBDevice *dev, USBPacket *p,
