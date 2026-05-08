@@ -2148,6 +2148,14 @@ static void usb_apple_magic_tablet_realize(USBDevice *dev, Error **errp)
 
     s->input_handler = qemu_input_handler_register(DEVICE(dev),
                                                    &amt_input_handler);
+    /*
+     * q35 chipset's built-in i8042 PS/2 mouse registers before USB devices,
+     * so without an explicit activate it stays the primary receiver. VNC /
+     * SDL motion would then go to PS/2, never reaching our handler. Mark
+     * ourselves active here so the apple-magic-tablet is the default mouse
+     * at boot — no operator-side `mouse_set` required.
+     */
+    qemu_input_handler_activate(s->input_handler);
 }
 
 static void usb_apple_magic_tablet_unrealize(USBDevice *dev)
