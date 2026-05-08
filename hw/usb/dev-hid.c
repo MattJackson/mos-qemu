@@ -2191,6 +2191,10 @@ static void usb_apple_magic_tablet_handle_control(USBDevice *dev, USBPacket *p,
 {
     int ret;
 
+    fprintf(stderr,
+            "[AMT-DBG] CTL req=0x%04x val=0x%04x idx=0x%04x len=%d\n",
+            request, value, index, length);
+
     ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
     if (ret >= 0) {
         return;
