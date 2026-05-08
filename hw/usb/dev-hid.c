@@ -1926,6 +1926,13 @@ typedef struct USBAppleMagicTabletState {
 
     /* 1 Hz heartbeat (3-byte 0x01 frame on EP1 IN). */
     QEMUTimer *heartbeat_timer;
+
+    /* Tracks whether AppleMultitouchTrackpadHIDEventDriver has seen a
+     * "finger arrived" frame (button=0 dx=0 dy=0 surface=0x03). The
+     * driver in macOS appears to ignore motion deltas until it has
+     * acknowledged a touch-on frame. We emit one synthetic touch-on
+     * frame on the first input event after realize / lift. */
+    bool     finger_touching;
 } USBAppleMagicTabletState;
 
 #define TYPE_USB_APPLE_MAGIC_TABLET "apple-magic-tablet"
@@ -2111,6 +2118,23 @@ static void amt_input_sync(DeviceState *dev)
         return;
     }
     s->pending_event = false;
+
+    if (!s->finger_touching) {
+        /* Synthetic "finger arrived" frame: button=0 dx=0 dy=0
+         * surface=0x03. Per the trackpad-input-reports capture, real
+         * Magic Trackpad always sends one of these before any motion
+         * deltas, and the multitouch driver in macOS won't apply
+         * deltas until it sees the touch-on anchor. */
+        static const uint8_t touch_on[8] = {
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03
+        };
+        fprintf(stderr,
+                "[AMT-DBG] synth touch-on frame (first input)\n");
+        amt_enqueue(s, touch_on, sizeof(touch_on));
+        usb_wakeup(s->intr, 0);
+        s->finger_touching = true;
+    }
+
     amt_emit_pointer_report(s);
 }
 
@@ -2143,6 +2167,7 @@ static void usb_apple_magic_tablet_realize(USBDevice *dev, Error **errp)
     s->last_abs_x = -1;       /* "no prior ABS event" sentinel */
     s->last_abs_y = -1;
     s->pending_event = false;
+    s->finger_touching = false;
 
     /*
      * Heartbeat disabled: the boot-mouse Trackpad/Boot interface descriptor
