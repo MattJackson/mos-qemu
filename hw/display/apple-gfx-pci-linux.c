@@ -197,17 +197,32 @@ apple_gfx_pci_unrealize(DeviceState *dev)
      * blocker registered in apple_gfx_common_realize are intentionally
      * not torn down here (pre-existing; not the focus of this fix).
      */
-    timer_del(&s->common.vblank_timer);
+   timer_del(&s->common.vblank_timer);
 
-    if (s->common.lagfx_disp) {
-        lagfx_display_free(s->common.lagfx_disp);
-        s->common.lagfx_disp = NULL;
-    }
+     /* Drain task queue before freeing device — prevents UAF if tasks
+      * reference freed state. lagfx_device_free does NOT drain tasks. */
+     AppleGFXLinuxTask *task, *tmp;
+     QTAILQ_FOREACH_SAFE(task, &s->common.tasks, links, tmp) {
+         QTAILQ_REMOVE(&s->common.tasks, task, links);
 
-    if (s->common.lagfx_dev) {
-        lagfx_device_free(s->common.lagfx_dev);
-        s->common.lagfx_dev = NULL;
-    }
+         if (task->mapped_region) {
+             memory_region_unref(task->mapped_region);
+         }
+         g_free(task);
+     }
+
+     /* MSI teardown — paired with msi_init at line 98. */
+     msi_uninit(pci_dev);
+
+     if (s->common.lagfx_disp) {
+         lagfx_display_free(s->common.lagfx_disp);
+         s->common.lagfx_disp = NULL;
+     }
+
+     if (s->common.lagfx_dev) {
+         lagfx_device_free(s->common.lagfx_dev);
+         s->common.lagfx_dev = NULL;
+     }
 
     qatomic_set(&s->common.pending_frames, 0);
 
@@ -218,11 +233,13 @@ apple_gfx_pci_unrealize(DeviceState *dev)
         s->common.surface = NULL;
     }
 
-    if (s->common.cursor) {
-        cursor_unref(s->common.cursor);
-        s->common.cursor = NULL;
-    }
-}
+  if (s->common.cursor) {
+         cursor_unref(s->common.cursor);
+         s->common.cursor = NULL;
+     }
+
+     qemu_mutex_destroy(&s->common.task_mutex);
+ }
 
 static const Property apple_gfx_pci_properties[] = {
     DEFINE_PROP_ARRAY("display-modes", AppleGFXPCIState,

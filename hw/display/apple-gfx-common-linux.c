@@ -25,6 +25,18 @@
 #define PG_PCI_BAR_MMIO 0
 #define PG_PCI_MAX_MSI_VECTORS 32
 
+/* AppleGFXDisplayMode: 3× uint16_t (6 bytes). lagfx_display_mode_t: 3× uint32_t
+ * (12 bytes). Direct cast reads garbage + walks past array end. Convert explicitly. */
+static void apple_gfx_modes_to_lagfx(lagfx_display_mode_t *out,
+                                     const AppleGFXDisplayMode *in,
+                                     unsigned count) {
+    for (unsigned i = 0; i < count; ++i) {
+        out[i].width_px  = in[i].width_px;
+        out[i].height_px = in[i].height_px;
+        out[i].refresh_rate_hz = in[i].refresh_rate_hz;
+    }
+}
+
 static const AppleGFXDisplayMode apple_gfx_default_modes[] = {
     { 1920, 1080, 60 },
     { 1440, 1080, 60 },
@@ -260,6 +272,8 @@ bool
 apple_gfx_unmap_memory(void *opaque, lagfx_task_t *task,
                        uint64_t virtual_offset, uint64_t length)
 {
+    (void)opaque;
+
     trace_apple_gfx_unmap_memory(task, virtual_offset, length);
 
     if (!lagfx_task_unmap(task, virtual_offset, length)) {
@@ -433,22 +447,15 @@ static void
 apple_gfx_frame_ready(void *opaque)
 {
     AppleGFXLinuxState *s = opaque;
-    int prev;
+  int prev = qatomic_cmpxchg(&s->pending_frames, 0, 1);
+     if (prev != 0 || s->pending_frames >= 2) {
+         return;
+     }
 
-    trace_apple_gfx_new_frame();
+     trace_apple_gfx_new_frame();
 
-    /* Cap pending at 2 + atomic ops: this callback can race the drain BH
-     * from a non-BQL library thread. */
-    if (qatomic_read(&s->pending_frames) >= 2) {
-        return;
-    }
-    prev = qatomic_fetch_add(&s->pending_frames, 1);
-    if (prev >= 1) {
-        return;
-    }
-
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            apple_gfx_frame_ready_bh, opaque);
+     aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                             apple_gfx_frame_ready_bh, opaque);
 }
 
 static void
@@ -665,9 +672,14 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
     disp_desc.size_mm_width = 400;   /* 20" display */
     disp_desc.size_mm_height = 300;
 
-    disp_desc.modes = (const lagfx_display_mode_t *)
-        (s->display_modes ? s->display_modes : display_modes);
-    disp_desc.mode_count = s->display_modes ? s->num_display_modes : num_display_modes;
+    /* Convert AppleGFXDisplayMode (3× uint16_t) to lagfx_display_mode_t
+     * (3× uint32_t). Can't cast directly — different layout. */
+    static lagfx_display_mode_t converted_modes[4];
+    unsigned mode_count = s->display_modes ? s->num_display_modes : num_display_modes;
+    const AppleGFXDisplayMode *src_modes = s->display_modes ? s->display_modes : display_modes;
+    apple_gfx_modes_to_lagfx(converted_modes, src_modes, mode_count);
+    disp_desc.modes = converted_modes;
+    disp_desc.mode_count = mode_count;
 
     disp_desc.callbacks.opaque = s;
     disp_desc.callbacks.frame_ready = apple_gfx_frame_ready;
@@ -676,28 +688,22 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
     disp_desc.callbacks.cursor_moved = apple_gfx_cursor_moved;
     disp_desc.callbacks.cursor_show = apple_gfx_cursor_show;
 
-    /* Console + initial surface MUST be set before lagfx_display_new:
-     * the library's display_rt_create synchronously fires
-     * notify_mode_changed → apple_gfx_mode_changed →
-     * dpy_gfx_replace_surface(s->con, ...). A NULL console there
-     * segfaults. The pre-published 1920x1080 surface also lets
-     * mode_changed early-return when the initial mode matches. */
     static const GraphicHwOps apple_gfx_hw_ops = {
-        .gfx_update = NULL,
-        .gfx_update_async = true,
-    };
+         .gfx_update = NULL,
+         .gfx_update_async = true,
+     };
 
-    s->con = graphic_console_init(dev, 0, &apple_gfx_hw_ops, s);
+     s->con = graphic_console_init(dev, 0, &apple_gfx_hw_ops, s);
 
-    s->surface = qemu_create_displaysurface(1920, 1080);
-    dpy_gfx_replace_surface(s->con, s->surface);
+     s->surface = qemu_create_displaysurface(1920, 1080);
+     dpy_gfx_replace_surface(s->con, s->surface);
 
-    /* Create display — may synchronously call apple_gfx_mode_changed.
+     /* Create display — may synchronously call apple_gfx_mode_changed.
       * Console + surface above must already be set. */
      s->lagfx_disp = lagfx_display_new(s->lagfx_dev, &disp_desc,
-                                        0, /* port */
-                                        next_pgdisplay_serial_num++,
-                                        &errp_lagfx);
+                                       0, /* port */
+                                       next_pgdisplay_serial_num++,
+                                       &errp_lagfx);
      if (!s->lagfx_disp) {
          error_setg(errp, "Failed to create lagfx_display: %s",
                     errp_lagfx ? errp_lagfx : "unknown");
@@ -708,7 +714,6 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
              s->surface = NULL;
          }
          if (s->con) {
-             graphic_console_uninit(s->con);
              s->con = NULL;
          }
 
