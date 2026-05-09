@@ -11,6 +11,7 @@
 #include "qemu/log.h"
 #include "qapi/visitor.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "qemu/aio-wait.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
@@ -472,9 +473,6 @@ apple_gfx_vblank_tick(void *opaque)
     AppleGFXLinuxState *s = opaque;
 
     info_report("apple-gfx: vblank tick fired");
-    if (qemu_log_enabled()) {
-        qemu_log("apple-gfx: vblank tick fired\n");
-    }
     trace_apple_gfx_vblank_tick();
 
     /* Tick may have been queued before unrealize completed; lagfx_dev
@@ -806,8 +804,8 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
     uint64_t next_fire = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
                          NANOSECONDS_PER_SECOND / 60;
     timer_mod(&s->vblank_timer, next_fire);
-    info_report("apple-gfx: vblank timer registered, first deadline=%llu ns",
-                (unsigned long long)next_fire);
+    info_report("apple-gfx: vblank timer registered, first deadline=%" PRIu64 " ns",
+                next_fire);
 
     return true;
 }
