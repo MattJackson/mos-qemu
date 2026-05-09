@@ -422,8 +422,8 @@ apple_gfx_vblank_tick(void *opaque)
         dpy_gfx_update_full(s->con);
         s->initial_surface_pushed = true;
     }
-    lagfx_display_tick_vblank(s->lagfx_dev, s,
-                              apple_gfx_write_memory);
+lagfx_display_tick_vblank(s->lagfx_dev, s,
+                               apple_gfx_write_memory, apple_gfx_read_memory);
     timer_mod(&s->vblank_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / 60);
@@ -548,6 +548,7 @@ apple_gfx_cursor_moved_bh(void *opaque)
     AppleGFXLinuxState *s = opaque;
     lagfx_coord_t pos = lagfx_display_cursor_position(s->lagfx_disp);
 
+    BQL_LOCK_GUARD();
     dpy_mouse_set(s->con, pos.x, pos.y, s->cursor_show);
 }
 
