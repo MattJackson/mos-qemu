@@ -721,14 +721,10 @@ if (!s->lagfx_disp) {
           }
 
 /* Unregister migration blocker — prevents stale blocker on retry. */
-Error *mig_err_local = NULL;
-if (migrate_del_blocker(apple_gfx_mig_blocker, &mig_err_local) < 0) {
-               qemu_log_mask(LOG_GUEST_ERROR, "apple-gfx: failed to unblock migrate\n");
-           }
-           error_free(mig_err_local);
+migrate_del_blocker(&apple_gfx_mig_blocker);
 
-           /* NULL lagfx_dev to prevent UAF if apple_gfx_pci_reset runs. */
-           s->lagfx_dev = NULL;
+/* NULL lagfx_dev to prevent UAF if apple_gfx_pci_reset runs. */
+s->lagfx_dev = NULL;
           lagfx_device_free(s->lagfx_dev);
 
           g_free(errp_lagfx);

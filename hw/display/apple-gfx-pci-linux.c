@@ -232,9 +232,9 @@ apple_gfx_pci_unrealize(DeviceState *dev)
 
     aio_bh_poll(qemu_get_aio_context());
 
-  /* Drop dpy_gfx_replace_surface(NULL) to let console own surface. */
-    if (s->con && s->common.surface) {
-        dpy_gfx_replace_surface(s->con, NULL);
+/* Drop dpy_gfx_replace_surface(NULL) to let console own surface. */
+if (s->common.con && s->common.surface) {
+        dpy_gfx_replace_surface(s->common.con, NULL);
     }
 
     if (s->common.cursor) {
