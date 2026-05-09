@@ -471,6 +471,7 @@ apple_gfx_vblank_tick(void *opaque)
 {
     AppleGFXLinuxState *s = opaque;
 
+    qemu_log_mask(LOG_DEBUG, "apple-gfx: vblank tick fired\n");
     trace_apple_gfx_vblank_tick();
 
     /* Tick may have been queued before unrealize completed; lagfx_dev
