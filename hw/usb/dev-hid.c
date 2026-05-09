@@ -2313,12 +2313,27 @@ static void usb_apple_magic_tablet_handle_control(USBDevice *dev, USBPacket *p,
          * Same blanket-ACK pattern as apple-magic-keyboard: return a
          * zero-filled payload of the declared per-Report-ID size so
          * macOS HID feature-report probes don't tight-loop on STALL.
+         *
+         * Report 0x90 (battery, declared in descriptor collection #2)
+         * gets a real "100% on AC, not charging" payload — without it,
+         * macOS' battery-aware code path may decline to fully arm the
+         * device. 2 bytes per descriptor: byte0 = 3 status bits +
+         * 5 bit padding; byte1 = battery percentage 0-255.
          */
         uint8_t report_id = value & 0xff;
         uint16_t reply_len;
         switch (report_id) {
         case 0x01: reply_len = 2; break;     /* heartbeat payload */
         case 0x02: reply_len = 7; break;     /* pointer payload */
+        case 0x90:                            /* battery */
+            if (length >= 2) {
+                data[0] = 0x01;              /* AC=1, charging=0, replace=0 */
+                data[1] = 100;               /* 100% */
+                p->actual_length = 2;
+                return;
+            }
+            reply_len = length;
+            break;
         default:   reply_len = (length > 0 && length <= 64) ? length : 1;
         }
         if (reply_len > length) {
