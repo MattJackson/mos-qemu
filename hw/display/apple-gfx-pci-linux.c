@@ -197,43 +197,43 @@ apple_gfx_pci_unrealize(DeviceState *dev)
      * blocker registered in apple_gfx_common_realize are intentionally
      * not torn down here (pre-existing; not the focus of this fix).
      */
-   timer_del(&s->common.vblank_timer);
+    timer_del(&s->common.vblank_timer);
 
-     /* Drain task queue before freeing device — prevents UAF if tasks
-      * reference freed state. lagfx_device_free does NOT drain tasks. */
-     AppleGFXLinuxTask *task, *tmp;
-     QTAILQ_FOREACH_SAFE(task, &s->common.tasks, node, tmp) {
-         QTAILQ_REMOVE(&s->common.tasks, task, node);
+    /* Drain task queue before freeing device — prevents UAF if tasks
+     * reference freed state. lagfx_device_free does NOT drain tasks. */
+    AppleGFXLinuxTask *task, *tmp;
+    QTAILQ_FOREACH_SAFE(task, &s->common.tasks, node, tmp) {
+        QTAILQ_REMOVE(&s->common.tasks, task, node);
 
-         /* Unref all MemoryRegions in the mapped_regions array. */
-         for (guint i = 0; i < task->mapped_regions->len; ++i) {
-             memory_region_unref(g_ptr_array_index(task->mapped_regions, i));
-         }
-         g_ptr_array_free(task->mapped_regions, TRUE);
+        /* Unref all MemoryRegions in the mapped_regions array. */
+        for (guint i = 0; i < task->mapped_regions->len; ++i) {
+            memory_region_unref(g_ptr_array_index(task->mapped_regions, i));
+        }
+        g_ptr_array_free(task->mapped_regions, TRUE);
 
-         g_free(task);
-     }
+        g_free(task);
+    }
 
-     /* MSI teardown — paired with msi_init at line 98. */
-     PCIDevice *pci_dev = PCI_DEVICE(dev);
-     msi_uninit(pci_dev);
+    /* MSI teardown — paired with msi_init at line 98. */
+    PCIDevice *pci_dev = PCI_DEVICE(dev);
+    msi_uninit(pci_dev);
 
-     if (s->common.lagfx_disp) {
-         lagfx_display_free(s->common.lagfx_disp);
-         s->common.lagfx_disp = NULL;
-     }
+    if (s->common.lagfx_disp) {
+        lagfx_display_free(s->common.lagfx_disp);
+        s->common.lagfx_disp = NULL;
+    }
 
-     if (s->common.lagfx_dev) {
-         lagfx_device_free(s->common.lagfx_dev);
-         s->common.lagfx_dev = NULL;
-     }
+    if (s->common.lagfx_dev) {
+        lagfx_device_free(s->common.lagfx_dev);
+        s->common.lagfx_dev = NULL;
+    }
 
     qatomic_set(&s->common.pending_frames, 0);
 
     aio_bh_poll(qemu_get_aio_context());
 
-/* Drop dpy_gfx_replace_surface(NULL) to let console own surface. */
-if (s->common.con && s->common.surface) {
+    /* Drop dpy_gfx_replace_surface(NULL) to let console own surface. */
+    if (s->common.con && s->common.surface) {
         dpy_gfx_replace_surface(s->common.con, NULL);
     }
 
@@ -242,8 +242,8 @@ if (s->common.con && s->common.surface) {
         s->common.cursor = NULL;
     }
 
-     qemu_mutex_destroy(&s->common.task_mutex);
- }
+    qemu_mutex_destroy(&s->common.task_mutex);
+}
 
 static const Property apple_gfx_pci_properties[] = {
     DEFINE_PROP_ARRAY("display-modes", AppleGFXPCIState,
