@@ -19,6 +19,8 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qemu/main-loop.h"
+#include "block/aio.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
 #include "hw/qdev-properties.h"
@@ -160,8 +162,41 @@ apple_gfx_pci_unrealize(DeviceState *dev)
 {
     AppleGFXPCIState *s = APPLE_GFX_PCI(dev);
 
-    /* Stop the vblank timer before tearing down lagfx_dev — otherwise
-     * a pending tick may dereference the freed device. */
+    /*
+     * Teardown ordering matters: callbacks from libapplegfx
+     * (frame_ready, cursor_glyph, cursor_moved, cursor_show, plus
+     * raise_interrupt from MMIO) all use aio_bh_schedule_oneshot()
+     * onto the main AioContext. A BH queued before unrealize will
+     * fire afterward and dereference freed s->cursor / s->lagfx_disp /
+     * s->con — the classic post-unrealize UAF.
+     *
+     * apple_gfx_frame_ready_bh() is also self-chaining via
+     * pending_frames > 0, so a single drain isn't enough on its own —
+     * we must atomically clear pending_frames first to disarm the
+     * re-arm path at the end of that BH.
+     *
+     * Sequence:
+     *   1. Stop vblank timer (host-side BH source).
+     *   2. Free libapplegfx display + device. Per the libapplegfx-vulkan
+     *      header (lagfx_display_free / lagfx_device_free), these
+     *      "Detach + free" — we ASSUME they block until in-flight
+     *      callbacks return before yielding. The header does not
+     *      explicitly document this; if a callback fires after free
+     *      returns there is a residual race the BH-drain below cannot
+     *      close (the callback would re-enter freed state).
+     *   3. Disarm the self-chaining frame_ready_bh by setting
+     *      pending_frames to 0 — its early-return path skips re-arm
+     *      when pending_frames <= 0.
+     *   4. Drain the main AioContext to run any BHs queued before
+     *      step 2 returned. After step 3 the frame BH cannot re-arm.
+     *   5. Free remaining QEMU-side state (surface, cursor) only
+     *      after the drain — by this point no scheduled BH can touch
+     *      these fields.
+     *
+     * Note: graphic_console_init's QemuConsole and the migration
+     * blocker registered in apple_gfx_common_realize are intentionally
+     * not torn down here (pre-existing; not the focus of this fix).
+     */
     timer_del(&s->common.vblank_timer);
 
     if (s->common.lagfx_disp) {
@@ -173,6 +208,10 @@ apple_gfx_pci_unrealize(DeviceState *dev)
         lagfx_device_free(s->common.lagfx_dev);
         s->common.lagfx_dev = NULL;
     }
+
+    qatomic_set(&s->common.pending_frames, 0);
+
+    aio_bh_poll(qemu_get_aio_context());
 
     if (s->common.surface) {
         qemu_free_displaysurface(s->common.surface);

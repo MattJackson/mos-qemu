@@ -693,18 +693,29 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
     dpy_gfx_replace_surface(s->con, s->surface);
 
     /* Create display — may synchronously call apple_gfx_mode_changed.
-     * Console + surface above must already be set. */
-    s->lagfx_disp = lagfx_display_new(s->lagfx_dev, &disp_desc,
-                                       0, /* port */
-                                       next_pgdisplay_serial_num++,
-                                       &errp_lagfx);
-    if (!s->lagfx_disp) {
-        error_setg(errp, "Failed to create lagfx_display: %s",
-                   errp_lagfx ? errp_lagfx : "unknown");
-        lagfx_device_free(s->lagfx_dev);
-        g_free(errp_lagfx);
-        return false;
-    }
+      * Console + surface above must already be set. */
+     s->lagfx_disp = lagfx_display_new(s->lagfx_dev, &disp_desc,
+                                        0, /* port */
+                                        next_pgdisplay_serial_num++,
+                                        &errp_lagfx);
+     if (!s->lagfx_disp) {
+         error_setg(errp, "Failed to create lagfx_display: %s",
+                    errp_lagfx ? errp_lagfx : "unknown");
+
+         /* Clean up console + surface allocated above — unrealize won't run. */
+         if (s->surface) {
+             qemu_free_displaysurface(s->surface);
+             s->surface = NULL;
+         }
+         if (s->con) {
+             graphic_console_uninit(s->con);
+             s->con = NULL;
+         }
+
+         lagfx_device_free(s->lagfx_dev);
+         g_free(errp_lagfx);
+         return false;
+     }
 
     /* 60 Hz vblank tick. Also performs the initial dpy_gfx_update_full —
      * doing it from realize segfaults because VNC/SDL backends aren't
