@@ -2592,30 +2592,22 @@ static void usb_apple_magic_tablet_handle_control(USBDevice *dev, USBPacket *p,
         }
         return;
     }
-    case VendorDeviceOutRequest | 0x40: {
+    case VendorDeviceOutRequest | 0x40:
         /*
          * Apple vendor command (observed value=0x0514 idx=0x0320 len=0).
          * macOS issues this twice: once after enumeration, once after
          * the first IN-endpoint poll. STALLing it caused the HID layer
-         * to lock IN polling. The Linux hid-magicmouse driver does NOT
-         * issue this command — it uses HID SET_REPORT(feature, ID=0x02,
-         * {0x02,0x01}) to enable multitouch. macOS' driver doesn't
-         * issue that SET_REPORT but DOES issue this vendor 0x40 cmd.
+         * to lock IN polling. Silently accept (the meaning is unknown).
          *
-         * Hypothesis: this IS macOS' multitouch enable equivalent.
-         * Flip multitouch_enabled here so subsequent input events emit
-         * Report 0x44 multitouch frames instead of Report 0x02 boot.
+         * Earlier hypothesis (this is macOS' multitouch enable
+         * equivalent of Linux's SET_REPORT) was tried and cursor still
+         * didn't move with our 11-byte Report 0x44 — likely because
+         * the Linux-RE'd 11-byte format is wrong for macOS, which
+         * expects the full 1388-byte multitouch frame. Until we have
+         * ground-truth bytes for Report 0x44, stay on Report 0x02
+         * boot mouse — multitouch_enabled stays false.
          */
-        USBAppleMagicTabletState *s = USB_APPLE_MAGIC_TABLET(dev);
-        if (!s->multitouch_enabled) {
-            s->multitouch_enabled = true;
-            fprintf(stderr,
-                    "[AMT-DBG] *** MULTITOUCH ENABLED via vendor 0x40 cmd "
-                    "(macOS-specific init path; val=0x%04x idx=0x%04x)\n",
-                    value, index);
-        }
         return;
-    }
     }
 
     p->status = USB_RET_STALL;
