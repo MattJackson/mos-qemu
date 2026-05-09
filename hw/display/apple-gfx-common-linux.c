@@ -1,53 +1,8 @@
 /*
- * QEMU Apple ParavirtualizedGraphics.framework device — Linux C port
- * Common device logic, portable from apple-gfx.m
+ * QEMU Apple ParavirtualizedGraphics.framework device — transport-agnostic core (Linux C port).
  *
- * Copyright © 2023–2026 Amazon/QEMU contributors
  * SPDX-License-Identifier: GPL-2.0-or-later
- *
- * This file contains the portable parts of apple-gfx.m refactored to C
- * and ported to use libapplegfx-vulkan instead of Apple's framework.
- * Ported for Linux; Metal/Metal-specific code removed.
- *
- * Last updated: 2026-05-01
- *
- * Cursor callbacks wired ✅ (commit 0511f24 + 69c063e)
- * Status: Docker host DOWN, can't verify noVNC visibility
- *
- * Cursor callback flow (2026-04-30):
- *   Guest opcode 0x13 (CmdDisplayCursorShow):
- *     → libapplegfx (ops_display_vchan.c) → apple_gfx_cursor_moved()
- *     → BH: apple_gfx_cursor_moved_bh() → dpy_mouse_set()
- *   Guest opcode 0x14 (CmdDisplayCursorGlyph):
- *     → libapplegfx (ops_display_vchan.c) → apple_gfx_cursor_glyph()
- *     → BGRA→RGBA conversion → dpy_cursor_define()
- *
- * Both opcodes travel on display vchan sub-channels (created via
- * opcode 0x04 CmdDefineChildFIFO), NOT the main display channel.
- * See paravirt-re/cursor-rendering-stage-20.md for pipeline.
- *
- * Current blocker: ABBA deadlock (WindowServer ↔ DisplayPipe)
- *   prevents full verification of cursor visibility in noVNC.
- *   - Thread 1 (WS): holds FB workloop gate, waits for
- *     accel[+0x88] IOLock in doSetDisplayMode.
- *   - Thread 2 (DisplayPipe): holds accel[+0x88] IOLock,
- *     waits for FB workloop gate in process_online.
- *   Fix attempts: 39a351c (defer online), aa91185 (wait 5 submits),
- *     40c1c7c (threshold=1), 7663ff1 (fix enabled flag) — NOT resolved.
- *   See journey/deadlock-abba-analysis.md.
- *
- * CURSOR VISIBILITY STATUS (2026-04-30): BLOCKED BY DEADLOCK
- *   - Cursor callbacks NOW FIRE (commit 0511f24 wires up dispatch)
- *   - But WindowServer hangs in ABBA deadlock before completing
- *     display initialization → cursor never becomes visible in noVNC
- *   - IOAccelDevice2=0, IOAccelShared2=0 (never created due to deadlock)
- *   - metal-test processes stuck in ?E/UN state (unkillable)
- *   - See paravirt-re/library/stage-20-cursor-status.md for details
- *
- * RE references:
- *   - paravirt-re/cursor-rendering-stage-20.md
- *   - paravirt-re/AppleParavirtDisplayPipe-vtable-decoded.md
- *   - paravirt-re/library/stage-20-cursor-status.md
+ * Copyright © 2023-2026 Amazon/QEMU contributors
  */
 
 #include "qemu/osdep.h"
@@ -229,9 +184,7 @@ apple_gfx_destroy_task(void *opaque, lagfx_task_t *task)
  * into the memfd on map; a future optimisation may share pages directly
  * (see libapplegfx-vulkan/src/memory/task.c). From this shell's view the
  * contract is "after this returns true, guest-visible writes to GPA are
- * reflected in the task VA range" — verified only for read-mostly ranges
- * in Phase 1.A.1. Flag for 1.B if we observe guest-writable DMA regions
- * relying on post-map coherence. (See R3 in phase-1a2-decoder-plan.md.)
+ * reflected in the task VA range" — verified for read-mostly ranges only.
  */
 bool
 apple_gfx_map_memory(void *opaque, lagfx_task_t *task,
@@ -396,30 +349,7 @@ apple_gfx_raise_interrupt(void *opaque, uint32_t vector)
 
 /* ------ Display Callbacks ------ */
 
-/*
- * Frame-ready bottom half: pull the most recent rendered frame out of
- * libapplegfx-vulkan and push it into QEMU's DisplaySurface.
- *
- * Runs under the BQL because DisplaySurface mutation / dpy_gfx_update
- * is not safe to call from arbitrary BH contexts on its own. The
- * pending_frames counter is incremented by apple_gfx_frame_ready()
- * (which libapplegfx calls from its render path) and drained here one
- * at a time; if additional frames arrived while we were draining, we
- * re-schedule ourselves so the display stays current without stalling
- * the renderer.
- *
- * LAGFX_ERR_NO_FRAME is the expected return while the library's
- * Vulkan render path is still in progress (Phase 2.A/2.B territory):
- * treat it as a silent no-op and drop the frame token — the next
- * frame_ready callback will re-arm us. Any other non-OK status is
- * logged at LOG_GUEST_ERROR since it points at a real library or
- * shell bug.
- *
- * Integration-tested end-to-end via docker-macos/tests/verify-m4.sh
- * (M4: first-pixel gate). There is no reasonable unit test for this
- * path because it requires a running QEMU with a live QemuConsole +
- * an initialised lagfx_display_t; both are harness-scale fixtures.
- */
+/* BQL is required for dpy_gfx_update + DisplaySurface mutation. */
 static void
 apple_gfx_frame_ready_bh(void *opaque)
 {
@@ -458,13 +388,6 @@ apple_gfx_frame_ready_bh(void *opaque)
                                  &stride_out, &new_frame);
 
     if (r == LAGFX_OK && new_frame) {
-        /*
-         * The library-reported stride should match DisplaySurface's
-         * stride; warn once-per-mismatch if they diverge (plan
-         * P2-R4). vkCmdCopyImageToBuffer -> linear BGRA8 buffer
-         * yields width*4 pitch, which matches QEMU's default
-         * DisplaySurface pitch on x86 hosts.
-         */
         if (stride_out != 0 && stride_out != stride) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "apple-gfx: stride mismatch: surface=%zu "
@@ -477,23 +400,13 @@ apple_gfx_frame_ready_bh(void *opaque)
                       width_px, height_px, stride);
         dpy_gfx_update(s->con, 0, 0, (int)width_px, (int)height_px);
     } else if (r == LAGFX_ERR_NO_FRAME) {
-        /*
-         * Library has no new frame yet; the Vulkan submit/readback
-         * pipeline will post one later via its own frame_ready
-         * callback. No-op — do not log, this is the hot path during
-         * early Phase 2 bring-up.
-         */
+        /* Hot path while the renderer is still warming up — silent. */
     } else if (r != LAGFX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "apple-gfx: lagfx_display_read_frame failed "
                       "(status=%d)\n", (int)r);
     }
 
-    /*
-     * More frames queued up while we were servicing this one — chain
-     * another BH so we don't leave the display stale. Guarded so we
-     * don't busy-loop if the library is stuck returning NO_FRAME.
-     */
     if (qatomic_read(&s->pending_frames) > 0) {
         aio_bh_schedule_oneshot(qemu_get_aio_context(),
                                 apple_gfx_frame_ready_bh, opaque);
@@ -524,21 +437,13 @@ apple_gfx_frame_ready(void *opaque)
 
     trace_apple_gfx_new_frame();
 
-    /*
-     * Drop frames if we're falling behind: cap pending_frames at 2 so
-     * a runaway renderer can't blow the BH queue. One BH is enough to
-     * drain; it will re-arm itself while work remains.
-     *
-     * This callback may run from a non-BQL library thread concurrently
-     * with the drain BH, so all access to pending_frames is via
-     * qatomic_* to match the BH's atomic read/sub.
-     */
+    /* Cap pending at 2 + atomic ops: this callback can race the drain BH
+     * from a non-BQL library thread. */
     if (qatomic_read(&s->pending_frames) >= 2) {
         return;
     }
     prev = qatomic_fetch_add(&s->pending_frames, 1);
     if (prev >= 1) {
-        /* Previous BH still in flight; it will chain to this frame. */
         return;
     }
 
@@ -565,51 +470,39 @@ apple_gfx_mode_changed(void *opaque, uint32_t width_px, uint32_t height_px)
     dpy_gfx_replace_surface(s->con, s->surface);
 }
 
+/*
+ * Cursor glyph callback (libapplegfx opcode 0x14
+ * CmdDisplayCursorGlyph). Invoked from a libapplegfx render thread
+ * with no BQL held; s->cursor and dpy_cursor_define() require the
+ * BQL, so we build the QEMUCursor here, transfer ownership to a BH,
+ * and let the BH do the swap + push.
+ *
+ * Pixel format: bgra_pixels arrives as BGRA (the display pipe
+ * byte-swaps the kext's ARGB before handing it off); QEMUCursor
+ * expects RGBA, so we reorder while copying.
+ */
+typedef struct {
+    AppleGFXLinuxState *s;
+    QEMUCursor *cursor;
+} AppleGFXCursorGlyphJob;
+
 static void
 apple_gfx_cursor_glyph_bh(void *opaque)
 {
-    /* Cursor glyph BH: QEMU requires BQL for dpy_cursor_define, but
-     * apple_gfx_cursor_glyph() already calls it directly (BQL not
-     * strictly required for cursor_define). This BH remains as a
-     * placeholder for any follow-up actions (e.g., cursor position
-     * sync) that may need the BQL in the future. */
-    g_free(opaque);
+    AppleGFXCursorGlyphJob *job = opaque;
+    AppleGFXLinuxState *s = job->s;
+
+    BQL_LOCK_GUARD();
+
+    if (s->cursor) {
+        cursor_unref(s->cursor);
+    }
+    s->cursor = job->cursor;
+    dpy_cursor_define(s->con, s->cursor);
+
+    g_free(job);
 }
 
-/*
- * Cursor glyph callback — invoked by libapplegfx-vulkan when it
- * receives opcode 0x14 (CmdDisplayCursorGlyph) from the guest.
- *
- * RE context (paravirt-re/cursor-rendering-stage-20.md):
- *   0x14 is emitted by AppleParavirtDisplayPipe::updateCursorGlyph()
- *   with a 64×64 (or similar) ARGB8888 bitmap at glyphVA.
- *   The guest sends this on a display vchan sub-channel (created
- *   via opcode 0x04 CmdDefineChildFIFO), NOT the main display channel.
- *   See also paravirt-re/AppleParavirtDisplayPipe-vtable-decoded.md
- *   for the vtable dispatch to updateCursorGlyph.
- *
- * The guest's hardware-cursor path expects an ack after this opcode;
- * libapplegfx signals the stamp internally. If we don't call
- * dpy_cursor_define(), the guest falls back to software-cursor
- * rendering into the main framebuffer (lag, smear, or disappearance
- * under Metal composition).
- * See paravirt-re/library/stage-20-cursor-status.md for status.
- *
- * Cursor pipeline flow (2026-04-30):
- *   Guest: emits 0x14 CmdDisplayCursorGlyph
- *     → libapplegfx handler (ops_display_vchan.c)
- *     → apple_gfx_cursor_glyph() [this callback]
- *     → QEMU dpy_cursor_define() sets cursor image
- *     → noVNC picks up cursor data via VNC rich cursor encoding
- *
- * DEADLOCK BLOCKER: Even though cursor callbacks NOW FIRE
- * (commit 0511f24), the ABBA deadlock prevents WindowServer
- * from fully initializing display — cursor may not appear.
- *
- * Pixel format note: bgra_pixels is BGRA (kext emits ARGB but the
- * display pipe byte-swaps to BGRA for the host). QEMU cursor expects
- * RGBA, so we reorder in the loop below.
- */
 static void
 apple_gfx_cursor_glyph(void *opaque,
                          const uint8_t *bgra_pixels,
@@ -617,24 +510,21 @@ apple_gfx_cursor_glyph(void *opaque,
                          lagfx_coord_t hotspot)
 {
     AppleGFXLinuxState *s = opaque;
+    AppleGFXCursorGlyphJob *job;
+    QEMUCursor *cursor;
+    uint32_t *dest_px;
+    const uint8_t *src_px;
 
     trace_apple_gfx_cursor_set(32, width, height);
 
-    if (s->cursor) {
-        cursor_unref(s->cursor);
-        s->cursor = NULL;
-    }
+    cursor = cursor_alloc(width, height);
+    cursor->hot_x = hotspot.x;
+    cursor->hot_y = hotspot.y;
 
-    s->cursor = cursor_alloc(width, height);
-    s->cursor->hot_x = hotspot.x;
-    s->cursor->hot_y = hotspot.y;
-
-    uint32_t *dest_px = s->cursor->data;
-    const uint8_t *src_px = bgra_pixels;
-
+    dest_px = cursor->data;
+    src_px = bgra_pixels;
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
-            /* bgra_pixels is BGRA; QEMU cursor expects RGBA */
             *dest_px = (src_px[2] << 16u) |  /* R */
                        (src_px[1] <<  8u) |  /* G */
                        (src_px[0] <<  0u) |  /* B */
@@ -644,24 +534,14 @@ apple_gfx_cursor_glyph(void *opaque,
         }
     }
 
-    dpy_cursor_define(s->con, s->cursor);
+    job = g_new0(AppleGFXCursorGlyphJob, 1);
+    job->s = s;
+    job->cursor = cursor;
 
-    /* Update cursor position on next BH */
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                             apple_gfx_cursor_glyph_bh, NULL);
+                             apple_gfx_cursor_glyph_bh, job);
 }
 
-/*
- * Cursor position BH — reads the display's cursor_position field
- * (updated by the 0x13 handler in libapplegfx) and pushes it to
- * QEMU's UI via dpy_mouse_set.
- *
- * The position is signed 16-bit in the 0x13 payload (RE-confirmed
- * at paravirt-re/re-followup-spec-gaps.md:1996) — this allows the
- * cursor to track off-screen during multi-display hand-off.
- * lagfx_display_cursor_position() returns the (x,y) stored by the
- * most recent 0x13 CmdDisplayCursorShow.
- */
 static void
 apple_gfx_cursor_moved_bh(void *opaque)
 {
@@ -671,34 +551,7 @@ apple_gfx_cursor_moved_bh(void *opaque)
     dpy_mouse_set(s->con, pos.x, pos.y, s->cursor_show);
 }
 
-/*
- * Cursor movement callback — invoked by libapplegfx-vulkan when
- * it receives opcode 0x13 (CmdDisplayCursorShow) from the guest.
- *
- * RE context (paravirt-re/cursor-rendering-stage-20.md):
- *   Emitted by AppleParavirtDisplayPipe::updateCursorState(u16 x,
- *   u16 y, bool visible). This is the hardware-cursor position +
- *   visibility update — NOT rendered through the main framebuffer
- *   pipeline, but as a separate overlay/compositing path in the
- *   display controller.
- *   See paravirt-re/AppleParavirtDisplayPipe-vtable-decoded.md
- *   for the vtable entry and paravirt-re/re-followup-spec-gaps.md
- *   for signed 16-bit position encoding at §1996.
- *
- * Cursor flow (2026-04-30):
- *   Guest: emits 0x13 CmdDisplayCursorShow
- *     → libapplegfx handler (ops_display_vchan.c)
- *     → apple_gfx_cursor_moved() [this callback] — triggers BH
- *     → apple_gfx_cursor_moved_bh() — reads cursor position
- *     → dpy_mouse_set(s->con, pos.x, pos.y, s->cursor_show)
- *     → QEMU VNC server picks up position + visibility
- *
- * DEADLOCK BLOCKER: WindowServer hangs in ABBA deadlock,
- *   so cursor position updates may not reach VNC in practice.
- *   See journey/deadlock-abba-analysis.md.
- *
- * Deferred to BH for BQL safety (QEMU console ops prefer BQL).
- */
+/* libapplegfx opcode 0x13 CmdDisplayCursorShow (position field). */
 static void
 apple_gfx_cursor_moved(void *opaque)
 {
@@ -707,35 +560,7 @@ apple_gfx_cursor_moved(void *opaque)
                              apple_gfx_cursor_moved_bh, opaque);
 }
 
-/*
- * Cursor visibility callback — invoked by libapplegfx-vulkan when
- * it receives opcode 0x13 (CmdDisplayCursorShow) with the 'visible'
- * field.
- *
- * RE context (paravirt-re/cursor-rendering-stage-20.md,
- * paravirt-re/AppleParavirtDisplayPipe-vtable-decoded.md):
- *   The guest's updateCursorState() emits one 0x13 per movement,
- *   with visible=1 during normal use. If we fail to honor visibility,
- *   the cursor may appear when it shouldn't (e.g., during display
- *   reconfiguration) or disappear unexpectedly.
- *   See paravirt-re/library/stage-20-cursor-status.md for stage 20%
- *   status: cursor callbacks wired but deadlock (§BLOCKER) prevents
- *   full verification.
- *
- * Cursor visibility flow (2026-04-30):
- *   Guest: emits 0x13 CmdDisplayCursorShow
- *     → libapplegfx handler (ops_display_vchan.c)
- *     → apple_gfx_cursor_show() [this callback]
- *     → sets s->cursor_show = show
- *     → BH: apple_gfx_cursor_moved_bh()
- *     → dpy_mouse_set(s->con, pos.x, pos.y, s->cursor_show)
- *     → QEMU VNC sends cursor visibility to VNC client
- *
- * DEADLOCK BLOCKER: WindowServer hangs in ABBA deadlock,
- *   so cursor may not be visible in practice (WS never completes
- *   display initialization to show cursor).
- *   See journey/deadlock-abba-analysis.md.
- */
+/* libapplegfx opcode 0x13 CmdDisplayCursorShow (visible field). */
 static void
 apple_gfx_cursor_show(void *opaque, bool show)
 {
@@ -843,25 +668,6 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
         (s->display_modes ? s->display_modes : display_modes);
     disp_desc.mode_count = s->display_modes ? s->num_display_modes : num_display_modes;
 
-    /*
-     * Set up display callbacks — these are invoked by libapplegfx-vulkan
-     * when the guest emits display-pipe opcodes on the vchan.
-     *
-     * Callback → Guest opcode mapping (RE-confirmed):
-     *   cursor_glyph  ← 0x14 CmdDisplayCursorGlyph
-     *     (AppleParavirtDisplayPipe::updateCursorGlyph @ kext+0x145619c4)
-     *   cursor_moved  ← 0x13 CmdDisplayCursorShow (position + visibility)
-     *     (AppleParavirtDisplayPipe::updateCursorState @ kext+0x14562094)
-     *   cursor_show   ← 0x13 CmdDisplayCursorShow (visibility field)
-     *
-     * Both 0x13/0x14 are sent on display vchan sub-channels
-     * (child FIFOs created via opcode 0x04 CmdDefineChildFIFO), not
-     * the main display channel.
-     *
-     * Without these callbacks wired, the guest's hardware-cursor path
-     * falls back to software-cursor rendering into the main framebuffer
-     * (paravirt-re/re-followup-spec-gaps.md:2012-2017).
-     */
     disp_desc.callbacks.opaque = s;
     disp_desc.callbacks.frame_ready = apple_gfx_frame_ready;
     disp_desc.callbacks.mode_changed = apple_gfx_mode_changed;
@@ -869,18 +675,14 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
     disp_desc.callbacks.cursor_moved = apple_gfx_cursor_moved;
     disp_desc.callbacks.cursor_show = apple_gfx_cursor_show;
 
-    /* Create QEMU console + initial surface BEFORE lagfx_display_new.
-     * lagfx_display_new synchronously invokes display_rt_create →
-     * notify_mode_changed → apple_gfx_mode_changed (our callback) →
-     * dpy_gfx_replace_surface(s->con, ...). If s->con is NULL or
-     * s->surface unset at that moment, that path segfaults. The
-     * pre-published 1920x1080 surface also lets apple_gfx_mode_changed
-     * early-return when libapplegfx fires the initial mode at the same
-     * dimensions. (Regression entered via libapplegfx-vulkan e0ba3a5,
-     * which moved notify_mode_changed into display_rt_create — before
-     * that commit it only fired on real mode changes after init.) */
+    /* Console + initial surface MUST be set before lagfx_display_new:
+     * the library's display_rt_create synchronously fires
+     * notify_mode_changed → apple_gfx_mode_changed →
+     * dpy_gfx_replace_surface(s->con, ...). A NULL console there
+     * segfaults. The pre-published 1920x1080 surface also lets
+     * mode_changed early-return when the initial mode matches. */
     static const GraphicHwOps apple_gfx_hw_ops = {
-        .gfx_update = NULL,  /* TODO(Phase-1.B): implement */
+        .gfx_update = NULL,
         .gfx_update_async = true,
     };
 
@@ -903,16 +705,9 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
         return false;
     }
 
-    /* Initial update push happens in the vblank tick (see apple_gfx_vblank_tick),
-     * NOT here. Calling dpy_gfx_update_full from realize segfaults: VNC/SDL
-     * display backends are not fully wired into the QemuConsole's listener
-     * chain at device realize time. Deferring to the first vblank tick
-     * (QEMU_CLOCK_VIRTUAL fires only after vCPU start) guarantees backends
-     * are ready. The user-visible cost is one ~16ms delay before noVNC sees
-     * black instead of "Guest has not initialized display (yet)". */
-
-    /* VBlank timer: ticks at ~60 Hz to advance the guest's vblank counter.
-     * WindowServer waits on this counter before submitting display updates. */
+    /* 60 Hz vblank tick. Also performs the initial dpy_gfx_update_full —
+     * doing it from realize segfaults because VNC/SDL backends aren't
+     * wired into the QemuConsole's listener chain until vCPU start. */
     timer_init_ns(&s->vblank_timer, QEMU_CLOCK_VIRTUAL,
                   apple_gfx_vblank_tick, s);
     timer_mod(&s->vblank_timer,

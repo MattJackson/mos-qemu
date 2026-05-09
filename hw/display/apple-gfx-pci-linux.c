@@ -35,15 +35,9 @@
 #define LAGFX_GPU_CORES_MAX 64u
 
 /*
- * PCI device identification.
- *
- * x86_64 macOS Sequoia AppleParavirtGPU.kext matches on
- * IOPCIMatch = "0xEEEE106B". IOKit encodes this pair as
- *   (device_id << 16) | vendor_id
- * so the actual values to set on the PCI device are
- *   vendor_id = 0x106B, device_id = 0xEEEE.
- * Confirmed by the Phase -1.D.1 attach commit (qemu-mos15@c785645)
- * which produced a real AppleParavirtGPUControl::start() trace.
+ * PCI device identification. AppleParavirtGPU.kext matches on
+ * IOPCIMatch = "0xEEEE106B", which IOKit encodes as
+ * (device_id << 16) | vendor_id, hence vendor=0x106B, device=0xEEEE.
  */
 #define PG_PCI_VENDOR_ID 0x106B
 #define PG_PCI_DEVICE_ID 0xEEEE
@@ -53,14 +47,10 @@
 #define PG_PCI_BAR_MMIO 0
 
 /*
- * Default option ROM filename, installed into qemu_datadir (pc-bios/) by the
- * build system. QEMU's PCI core looks this up via qemu_find_file() at realize
- * time and maps it into a ROM BAR for us. Users can override at the CLI with
- * `-device apple-gfx-pci,romfile=/path/to/other.rom` — the `romfile` property
- * is inherited from the base PCIDevice class (see hw/pci/pci.c).
- *
- * Phase 1.E: Apple's AppleParavirtEFI.rom is shipped during dev; Phase 5.X
- * replaces with own EDK2 build.
+ * Default option ROM filename, installed into qemu_datadir (pc-bios/) by
+ * the build system. QEMU's PCI core looks it up via qemu_find_file() at
+ * realize time and maps it into a ROM BAR. Override with
+ * `-device apple-gfx-pci,romfile=/path/to/other.rom`.
  */
 #define PG_PCI_DEFAULT_ROMFILE "apple-gfx-pci.rom"
 
@@ -102,7 +92,7 @@ apple_gfx_pci_realize(PCIDevice *pci_dev, Error **errp)
     pci_register_bar(pci_dev, PG_PCI_BAR_MMIO,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &common->iomem_gfx);
 
-    /* Initialize MSI-X for interrupt delivery */
+    /* Legacy MSI (intentional — MSI-X is unsupported; see CLAUDE.md). */
     ret = msi_init(pci_dev, 0x0 /* config offset; 0 = auto */,
                    PG_PCI_MAX_MSI_VECTORS, true /* msi64bit */,
                    false /* msi_per_vector_mask */, errp);
@@ -146,49 +136,6 @@ apple_gfx_pci_realize(PCIDevice *pci_dev, Error **errp)
     }
     device_desc.thread_count = common->gpu_cores;
 
-/*
- * Initialize common device state — this is where the display
- * callbacks (frame_ready, mode_changed, cursor_glyph, cursor_moved,
- * cursor_show) are registered with libapplegfx-vulkan.
- *
- * Cursor pipeline (RE-confirmed at paravirt-re/cursor-rendering-stage-20.md):
- *   Guest emits 0x13 CmdDisplayCursorShow →
- *     libapplegfx handler → cursor_moved + cursor_show callbacks →
- *     QEMU dpy_mouse_set() (cursor position + visibility)
- *
- *   Guest emits 0x14 CmdDisplayCursorGlyph →
- *     libapplegfx handler → cursor_glyph callback →
- *     QEMU dpy_cursor_define() (cursor image upload, BGRA→RGBA)
- *
- * Both opcodes travel on display vchan sub-channels (not main
- * display channel) — created via opcode 0x04 CmdDefineChildFIFO.
- * See paravirt-re/flows/display-init-flow.md and
- * paravirt-re/AppleParavirtDisplayPipe-vtable-decoded.md.
- *
- * Stage 20% target: cursor visible + movable. Stage 30%+ builds
- * on this with actual rendering via render opcodes.
- *
- * Cursor visibility status (2026-04-30):
- *   - Callbacks NOW FIRE in QEMU (commit 0511f24 wires up
- *     cursor opcode dispatch via protocol.c fix).
- *   - s->cursor_show flag is set by apple_gfx_cursor_show().
- *   - dpy_mouse_set() is called with s->cursor_show as visibility.
- *   - DEADLOCK BLOCKER: WindowServer hangs in ABBA deadlock,
- *     so cursor may not be visible in practice (WS never completes
- *     display initialization to show cursor).
- *   - See paravirt-re/library/stage-20-cursor-status.md.
- *
- * What's needed for noVNC to show cursor:
- *   1. Deadlock must be resolved (stage 10% blocker).
- *   2. VNC server must pick up cursor changes via QEMU's
- *      dpy_cursor_define() + dpy_mouse_set() callbacks.
- *   3. For hardware cursor: QEMU's VNC uses cursor data from
- *      dpy_cursor_define(); ensure BGRA→RGBA conversion is correct.
- *   4. For software cursor (fallback): guest renders cursor into
- *      framebuffer; requires working render opcodes (stage 30%+).
- *   5. noVNC cursor visibility also depends on VNC encoding
- *      (rich cursor encoding via QEMU's cursor data path).
- */
     if (!apple_gfx_common_realize(common, DEVICE(pci_dev), &device_desc, errp)) {
         return;
     }
@@ -212,6 +159,10 @@ static void
 apple_gfx_pci_unrealize(DeviceState *dev)
 {
     AppleGFXPCIState *s = APPLE_GFX_PCI(dev);
+
+    /* Stop the vblank timer before tearing down lagfx_dev — otherwise
+     * a pending tick may dereference the freed device. */
+    timer_del(&s->common.vblank_timer);
 
     if (s->common.lagfx_disp) {
         lagfx_display_free(s->common.lagfx_disp);
@@ -269,16 +220,6 @@ apple_gfx_pci_class_init(ObjectClass *klass, const void *data)
     pci->class_id = PCI_CLASS_DISPLAY_VGA;
     pci->realize = apple_gfx_pci_realize;
 
-    /*
-     * Phase 1.E: Apple's AppleParavirtEFI.rom is shipped during dev;
-     * Phase 5.X replaces with own EDK2 build.
-     *
-     * This sets the default ROM. It can be overridden at instantiation via
-     *   -device apple-gfx-pci,romfile=/path/to/alt.rom
-     * The `romfile` property is registered on the base PCIDevice class
-     * (see DEFINE_PROP_STRING("romfile", ...) in hw/pci/pci.c), and the PCI
-     * core loads it via qemu_find_file(QEMU_FILE_TYPE_BIOS, ...) at realize.
-     */
     pci->romfile = PG_PCI_DEFAULT_ROMFILE;
 
     device_class_set_props(dc, apple_gfx_pci_properties);
