@@ -525,7 +525,8 @@ apple_gfx_cursor_glyph(void *opaque,
     uint32_t *dest_px;
     const uint8_t *src_px;
 
-    trace_apple_gfx_cursor_set(32, width, height);
+    /* BPP is always 32 for QEMU cursors — no need to trace dead constant. */
+    trace_apple_gfx_cursor_set(width, height);
 
     cursor = cursor_alloc(width, height);
     cursor->hot_x = hotspot.x;
@@ -632,7 +633,7 @@ apple_gfx_common_init(Object *obj, AppleGFXLinuxState *s)
     /* Default MMIO region size; libapplegfx may override */
     size_t mmio_range_size = 0x4000;  /* 16 KB default */
 
-    trace_apple_gfx_common_init("apple-gfx-linux", mmio_range_size);
+    trace_apple_gfx_common_init(object_get_typename(obj), mmio_range_size);
 
     memory_region_init_io(&s->iomem_gfx, obj, &apple_gfx_mmio_ops, s,
                           "apple-gfx-mmio", mmio_range_size);
