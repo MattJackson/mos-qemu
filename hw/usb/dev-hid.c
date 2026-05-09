@@ -1752,76 +1752,55 @@ static const USBDescStrings desc_strings_amt = {
 };
 
 /*
- * HID Report Descriptor — declares two input reports matching the
- * captured wire format exactly. Total report sizes (excluding the
- * leading ReportID byte the USB stack prepends):
- *   RID 0x01: 2 bytes  (heartbeat payload)
- *   RID 0x02: 7 bytes  (button + dX + dY + EX + EY + reserved + state)
+ * Magic Trackpad 2 USB device structure — FOUR INTERFACES.
+ *
+ * Real device structure (verified 2026-05-09 via Linux usbmon pcap; see
+ * paravirt-re/library/apple-magic-hid/captures/usb-pcap-2026-05-09.md):
+ *
+ *   Interface 0 — vendor reports
+ *     bSubClass=0 bProto=0, IN ep1, 16 B max, 8 ms interval
+ *     Reports: 0xe0 (4 B), 0x9a (1 B), 0x90 (battery 2 B)
+ *
+ *   Interface 1 — Mouse + Digitizer + Vendor 0x0c — PRIMARY CURSOR PATH
+ *     bSubClass=1 bProto=2 (BOOT MOUSE), IN ep3, 64 B max, 1 (microframe)
+ *     Reports: 0x02 (8 B boot mouse), 0x3f (16 B digitizer),
+ *              0x44 (1387 B multitouch raw)
+ *     Multitouch enable: SET_REPORT(feature, ID=0x02, payload {0x02,0x01})
+ *     on this interface switches the device into multitouch mode and the
+ *     trackpad starts emitting Report 0x44 frames on ep3.
+ *
+ *   Interface 2 — vendor 0x0d
+ *     bSubClass=0 bProto=0, IN ep4 (16 B/8ms) + OUT ep4 (64 B/2)
+ *     Reports: 0x3f (15 B input), 0x53 (63 B output)
+ *
+ *   Interface 3 — vendor 0x03
+ *     bSubClass=0 bProto=0, IN ep5 (64 B/2)
+ *     Reports: 0xc0 (107 B input)
+ *
+ * v1 emulator emits on Interface 0 ep1 (vendor heartbeats, currently off)
+ * and Interface 1 ep3 (boot mouse pre-enable, multitouch post-enable).
+ * Interfaces 2/3 are declared so macOS's driver match accepts the device,
+ * but their endpoints are not driven (NAK forever).
  */
-/*
- * Trackpad/Boot HID Report Descriptor — byte-for-byte the real Apple
- * Magic Trackpad 2's Interface 1 descriptor (PID 0x0265), captured
- * 2026-05-08 from a real device plugged into a Mac. Source:
- * paravirt-re/library/apple-magic-hid/captures/usb-magic-2/
- * 04-ioreg-usbhostdevice.txt.
- *
- * Three application collections:
- *
- *   App 1, Generic Desktop / Mouse (Report 0x02, 8 bytes):
- *     byte 0: report ID (0x02)
- *     byte 1: bits 0..2 = Buttons 1..3, bits 3..7 = padding
- *     byte 2: signed int8 dX (REL)
- *     byte 3: signed int8 dY (REL)
- *     bytes 4-7: 4 reserved bytes
- *
- *   App 2, Digitizer / Touch Pad (Report 0x3f, 17 bytes):
- *     16 bytes vendor input frame — declared but not emitted by the
- *     emulator (multi-touch protocol gated behind a vendor-enable
- *     SET_REPORT, out of v1 scope).
- *
- *   App 3, Vendor 0xff00 (Report 0x44, 1388 bytes):
- *     1387-byte vendor multi-touch frame — declared but not emitted.
- *
- * AppleMultitouchTrackpadHIDEventDriver claims this interface via
- * Apple PID match and pulls cursor motion from Report 0x02. The other
- * two collections are declared so its match-dictionary accepts the
- * descriptor; without them the driver's start path stalls
- * IOHIDInterface during ::start.
- */
-/*
- * Magic Trackpad 2 USB report descriptor.
- *
- * Real device declares FOUR application collections (visible in macOS ioreg
- * as four separate IOHIDDevice instances under one parent USB device). When
- * we declared only the Mouse-bearing collection (~110 bytes), the multitouch
- * driver bound (PID/VID match) but refused to drive the cursor — macOS
- * apparently treats a Magic Trackpad with missing companion collections as
- * "incomplete hardware" and parks the pointer pipe.
- *
- * Collections, byte-for-byte from
- * paravirt-re/library/apple-magic-hid/captures/magic-trackpad-usb-2026-05-06:
- *
- *   #1 [PRESENT BELOW]   Mouse + Digitizer + Vendor 0xff00/0x0c (110 B)
- *                        Reports 0x02 (boot mouse, 8 B), 0x3f (digitizer 16 B),
- *                        0x44 (vendor multitouch raw, 1387 B).
- *
- *   #2 [APPENDED BELOW]  Vendor 0xff00/0x0b + Vendor 0xff00/0x14 (45 B)
- *                        Reports 0xe0 / 0x9a (vendor) + 0x90 (battery: AC,
- *                        charging, needsReplace, %).
- *                        AppleDeviceManagementHIDEventService binds here.
- *
- *   #3 [SKIPPED]         Vendor 0xff00/0x0d (35 B). Reports 0x3f (15 B input)
- *                        and 0x53 (63 B feature). SKIPPED — Report 0x3f
- *                        collides with the digitizer 0x3f in #1; Report IDs
- *                        are global per USB interface.
- *
- *   #4 [APPENDED BELOW]  Vendor 0xff00/0x03 (27 B). Report 0xc0 (107 B input).
- *
- * Collection #1 stays first so PrimaryUsagePage=1 (Generic Desktop) — the
- * matching attribute the multitouch driver looks for.
- */
-static const uint8_t apple_magic_tablet_hid_report_descriptor[] = {
-    /* === Collection #1: Mouse + Digitizer + Vendor 0xff00/0x0c (110 B) === */
+
+/* Interface 0 HID Report Descriptor — 83 bytes (vendor reports). */
+static const uint8_t amt_iface0_report_desc[] = {
+    0x06, 0x00, 0xff, 0x09, 0x0b, 0xa1, 0x01, 0x06,
+    0x00, 0xff, 0x09, 0x0b, 0x15, 0x00, 0x26, 0xff,
+    0x00, 0x75, 0x08, 0x96, 0x04, 0x00, 0x85, 0xe0,
+    0x81, 0x22, 0x09, 0x0b, 0x96, 0x01, 0x00, 0x85,
+    0x9a, 0x81, 0x22, 0xc0, 0x06, 0x00, 0xff, 0x09,
+    0x14, 0xa1, 0x01, 0x85, 0x90, 0x05, 0x84, 0x75,
+    0x01, 0x95, 0x03, 0x15, 0x00, 0x25, 0x01, 0x09,
+    0x61, 0x05, 0x85, 0x09, 0x44, 0x09, 0x46, 0x81,
+    0x02, 0x95, 0x05, 0x81, 0x01, 0x75, 0x08, 0x95,
+    0x01, 0x15, 0x00, 0x26, 0xff, 0x00, 0x09, 0x65,
+    0x81, 0x02, 0xc0,
+};
+
+/* Interface 1 HID Report Descriptor — 110 bytes (Mouse + Digitizer + Vendor
+ * 0x0c). Cursor-driving interface. Reports 0x02 / 0x3f / 0x44. */
+static const uint8_t amt_iface1_report_desc[] = {
     0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01,
     0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
     0x15, 0x00, 0x25, 0x01, 0x85, 0x02, 0x95, 0x03,
@@ -1836,64 +1815,146 @@ static const uint8_t apple_magic_tablet_hid_report_descriptor[] = {
     0xa1, 0x01, 0x06, 0x00, 0xff, 0x09, 0x0c, 0x15,
     0x00, 0x26, 0xff, 0x00, 0x85, 0x44, 0x75, 0x08,
     0x96, 0x6b, 0x05, 0x81, 0x00, 0xc0,
-    /* === Collection #2: Vendor 0xff00/0x0b + 0x14 (45 B) ===
-     * Reports 0xe0 (vendor 4 B), 0x9a (vendor 1 B),
-     *         0x90 (AC mains + charging + needs-replace + battery %). */
-    0x06, 0x00, 0xff, 0x09, 0x0b, 0xa1, 0x01, 0x06,
-    0x00, 0xff, 0x09, 0x0b, 0x15, 0x00, 0x26, 0xff,
-    0x00, 0x75, 0x08, 0x96, 0x04, 0x00, 0x85, 0xe0,
-    0x81, 0x22, 0x09, 0x0b, 0x96, 0x01, 0x00, 0x85,
-    0x9a, 0x81, 0x22, 0xc0, 0x06, 0x00, 0xff, 0x09,
-    0x14, 0xa1, 0x01, 0x85, 0x90, 0x05, 0x84, 0x75,
-    0x01, 0x95, 0x03, 0x15, 0x00, 0x25, 0x01, 0x09,
-    0x61, 0x05, 0x85, 0x09, 0x44, 0x09, 0x46, 0x81,
-    0x02, 0x95, 0x05, 0x81, 0x01, 0x75, 0x08, 0x95,
-    0x01, 0x15, 0x00, 0x26, 0xff, 0x00, 0x09, 0x65,
-    0x81, 0x02, 0xc0,
-    /* === Collection #4: Vendor 0xff00/0x03 (27 B) ===
-     * Report 0xc0 (107 B input, purpose unknown). */
+};
+
+/* Interface 2 HID Report Descriptor — 36 bytes (vendor 0x0d). */
+static const uint8_t amt_iface2_report_desc[] = {
+    0x06, 0x00, 0xff, 0x09, 0x0d, 0xa1, 0x01, 0x06,
+    0x00, 0xff, 0x09, 0x0d, 0x15, 0x00, 0x26, 0xff,
+    0x00, 0x75, 0x08, 0x85, 0x3f, 0x96, 0x0f, 0x00,
+    0x81, 0x02, 0x09, 0x0d, 0x85, 0x53, 0x96, 0x3f,
+    0x00, 0x91, 0x02, 0xc0,
+};
+
+/* Interface 3 HID Report Descriptor — 27 bytes (vendor 0x03). */
+static const uint8_t amt_iface3_report_desc[] = {
     0x06, 0x00, 0xff, 0x09, 0x03, 0xa1, 0x01, 0x06,
     0x00, 0xff, 0x09, 0x03, 0x15, 0x00, 0x26, 0xff,
     0x00, 0x85, 0xc0, 0x96, 0x6b, 0x00, 0x75, 0x08,
     0x81, 0x02, 0xc0,
 };
 
-static const USBDescIface desc_iface_apple_magic_tablet = {
-    .bInterfaceNumber              = 0,
-    .bNumEndpoints                 = 1,
-    .bInterfaceClass               = USB_CLASS_HID,
-    /*
-     * Trackpad / Boot interface — boot mouse, mirroring real Apple
-     * Magic Trackpad 2's Interface 1 (PID 0x0265). bSubClass=1
-     * (boot), bProtocol=2 (mouse). AppleMultitouchTrackpadHIDEventDriver
-     * matches on these properties + Apple PID; without them the driver
-     * binds but doesn't pull cursor motion from Report 0x02.
-     */
-    .bInterfaceSubClass            = 0x01,        /* boot */
-    .bInterfaceProtocol            = 0x02,        /* mouse */
-    .iInterface                    = STR_AMT_INTERFACE,
-    .ndesc                         = 1,
-    .descs = (USBDescOther[]) {
-        {
-            /* HID descriptor */
-            .data = (uint8_t[]) {
-                0x09,                            /* bLength */
-                USB_DT_HID,                      /* bDescriptorType */
-                0x11, 0x01,                      /* bcdHID 1.11 */
-                0x00,                            /* bCountryCode */
-                0x01,                            /* bNumDescriptors */
-                USB_DT_REPORT,                   /* bDescriptorType: Report */
-                sizeof(apple_magic_tablet_hid_report_descriptor) & 0xff,
-                sizeof(apple_magic_tablet_hid_report_descriptor) >> 8,
+static const USBDescIface desc_ifaces_apple_magic_tablet[] = {
+    /* === Interface 0 — vendor reports === */
+    {
+        .bInterfaceNumber              = 0,
+        .bNumEndpoints                 = 1,
+        .bInterfaceClass               = USB_CLASS_HID,
+        .bInterfaceSubClass            = 0,
+        .bInterfaceProtocol            = 0,
+        .iInterface                    = STR_AMT_INTERFACE,
+        .ndesc                         = 1,
+        .descs = (USBDescOther[]) {
+            {
+                .data = (uint8_t[]) {
+                    0x09, USB_DT_HID,
+                    0x10, 0x01,                /* bcdHID 1.10 */
+                    0x00, 0x01, USB_DT_REPORT,
+                    sizeof(amt_iface0_report_desc) & 0xff,
+                    sizeof(amt_iface0_report_desc) >> 8,
+                },
+            },
+        },
+        .eps = (USBDescEndpoint[]) {
+            {
+                .bEndpointAddress      = USB_DIR_IN | 0x01,
+                .bmAttributes          = USB_ENDPOINT_XFER_INT,
+                .wMaxPacketSize        = 16,
+                .bInterval             = 8,
             },
         },
     },
-    .eps = (USBDescEndpoint[]) {
-        {
-            .bEndpointAddress      = USB_DIR_IN | 0x01,
-            .bmAttributes          = USB_ENDPOINT_XFER_INT,
-            .wMaxPacketSize        = 8,
-            .bInterval             = 8, /* matches real Magic Trackpad */
+    /* === Interface 1 — Mouse + Digitizer + Vendor 0x0c (cursor path) === */
+    {
+        .bInterfaceNumber              = 1,
+        .bNumEndpoints                 = 1,
+        .bInterfaceClass               = USB_CLASS_HID,
+        .bInterfaceSubClass            = 0x01,    /* boot */
+        .bInterfaceProtocol            = 0x02,    /* mouse */
+        .iInterface                    = STR_AMT_INTERFACE,
+        .ndesc                         = 1,
+        .descs = (USBDescOther[]) {
+            {
+                .data = (uint8_t[]) {
+                    0x09, USB_DT_HID,
+                    0x10, 0x01,                /* bcdHID 1.10 */
+                    0x00, 0x01, USB_DT_REPORT,
+                    sizeof(amt_iface1_report_desc) & 0xff,
+                    sizeof(amt_iface1_report_desc) >> 8,
+                },
+            },
+        },
+        .eps = (USBDescEndpoint[]) {
+            {
+                .bEndpointAddress      = USB_DIR_IN | 0x03,    /* EP3 */
+                .bmAttributes          = USB_ENDPOINT_XFER_INT,
+                .wMaxPacketSize        = 64,
+                .bInterval             = 1,
+            },
+        },
+    },
+    /* === Interface 2 — vendor 0x0d (declared, NAK'd in v1) === */
+    {
+        .bInterfaceNumber              = 2,
+        .bNumEndpoints                 = 2,
+        .bInterfaceClass               = USB_CLASS_HID,
+        .bInterfaceSubClass            = 0,
+        .bInterfaceProtocol            = 0,
+        .iInterface                    = STR_AMT_INTERFACE,
+        .ndesc                         = 1,
+        .descs = (USBDescOther[]) {
+            {
+                .data = (uint8_t[]) {
+                    0x09, USB_DT_HID,
+                    0x10, 0x01,
+                    0x00, 0x01, USB_DT_REPORT,
+                    sizeof(amt_iface2_report_desc) & 0xff,
+                    sizeof(amt_iface2_report_desc) >> 8,
+                },
+            },
+        },
+        .eps = (USBDescEndpoint[]) {
+            {
+                .bEndpointAddress      = USB_DIR_IN | 0x04,    /* EP4 IN */
+                .bmAttributes          = USB_ENDPOINT_XFER_INT,
+                .wMaxPacketSize        = 16,
+                .bInterval             = 8,
+            },
+            {
+                .bEndpointAddress      = USB_DIR_OUT | 0x04,   /* EP4 OUT */
+                .bmAttributes          = USB_ENDPOINT_XFER_INT,
+                .wMaxPacketSize        = 64,
+                .bInterval             = 2,
+            },
+        },
+    },
+    /* === Interface 3 — vendor 0x03 (declared, NAK'd in v1) === */
+    {
+        .bInterfaceNumber              = 3,
+        .bNumEndpoints                 = 1,
+        .bInterfaceClass               = USB_CLASS_HID,
+        .bInterfaceSubClass            = 0,
+        .bInterfaceProtocol            = 0,
+        .iInterface                    = STR_AMT_INTERFACE,
+        .ndesc                         = 1,
+        .descs = (USBDescOther[]) {
+            {
+                .data = (uint8_t[]) {
+                    0x09, USB_DT_HID,
+                    0x10, 0x01,
+                    0x00, 0x01, USB_DT_REPORT,
+                    sizeof(amt_iface3_report_desc) & 0xff,
+                    sizeof(amt_iface3_report_desc) >> 8,
+                },
+            },
+        },
+        .eps = (USBDescEndpoint[]) {
+            {
+                .bEndpointAddress      = USB_DIR_IN | 0x05,    /* EP5 IN */
+                .bmAttributes          = USB_ENDPOINT_XFER_INT,
+                .wMaxPacketSize        = 64,
+                .bInterval             = 2,
+            },
         },
     },
 };
@@ -1904,13 +1965,13 @@ static const USBDescDevice desc_device_apple_magic_tablet = {
     .bNumConfigurations            = 1,
     .confs = (USBDescConfig[]) {
         {
-            .bNumInterfaces        = 1,
+            .bNumInterfaces        = 4,
             .bConfigurationValue   = 1,
             .iConfiguration        = STR_AMT_PRODUCT,
             .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
             .bMaxPower             = 250, /* 500 mA — matches real */
-            .nif                   = 1,
-            .ifs                   = &desc_iface_apple_magic_tablet,
+            .nif                   = 4,
+            .ifs                   = desc_ifaces_apple_magic_tablet,
         },
     },
 };
@@ -2010,6 +2071,14 @@ typedef struct USBAppleMagicTabletState {
      * Report 0x02 deltas. */
     int32_t  trackpad_x;
     int32_t  trackpad_y;
+
+    /* True after the host issues SET_REPORT(feature, ID=0x02, payload
+     * {0x02, 0x01}) on Interface 1 — the multitouch enable command (per
+     * Linux hid-magicmouse `feature_mt_trackpad2_usb[]`, verified
+     * 2026-05-09 in the real-device pcap). Until set, we emit Report
+     * 0x02 boot-mouse on Interface 1 EP3. After set, we emit Report
+     * 0x44 multitouch frames instead. */
+    bool     multitouch_enabled;
 } USBAppleMagicTabletState;
 
 #define TYPE_USB_APPLE_MAGIC_TABLET "apple-magic-tablet"
@@ -2272,32 +2341,33 @@ static void amt_input_sync(DeviceState *dev)
     }
     s->pending_event = false;
 
-    if (!s->finger_touching) {
-        /* Synthetic "finger arrived" frame: button=0 dx=0 dy=0
-         * surface=0x03. Per the trackpad-input-reports capture, real
-         * Magic Trackpad always sends one of these before any motion
-         * deltas, and the multitouch driver in macOS won't apply
-         * deltas until it sees the touch-on anchor. */
-        static const uint8_t touch_on[8] = {
-            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03
-        };
-        fprintf(stderr,
-                "[AMT-DBG] synth touch-on frame (first input)\n");
-        amt_enqueue(s, touch_on, sizeof(touch_on));
-        usb_wakeup(s->intr, 0);
-        s->finger_touching = true;
-    }
-
     /*
-     * Emit BOTH the boot-mouse Report 0x02 (for IOHIDPointing-style
-     * consumers) AND the multitouch Report 0x44 (for
-     * AppleMultitouchTrackpadHIDEventDriver, which is the driver that
-     * actually binds on Magic Trackpad PIDs). Boot mouse alone is
-     * empirically insufficient; multitouch alone might be too if any
-     * upper-layer code reads boot-mouse state. Keep both.
+     * Branch on multitouch_enabled. Per the 2026-05-09 USB pcap, the
+     * real device emits boot-mouse Report 0x02 only before macOS issues
+     * the SET_REPORT(feature, ID=0x02, {0x02, 0x01}) on Interface 1, and
+     * switches to Report 0x44 multitouch frames immediately after. The
+     * multitouch driver consumes Report 0x44 (NOT Report 0x02) for
+     * cursor motion — so emitting boot mouse after enable would just
+     * waste IN-pipe bandwidth.
      */
-    amt_emit_pointer_report(s);
-    amt_emit_multitouch_report(s);
+    if (s->multitouch_enabled) {
+        amt_emit_multitouch_report(s);
+    } else {
+        if (!s->finger_touching) {
+            /* Synthetic "finger arrived" frame for the boot-mouse face.
+             * Real Magic Trackpad sends one of these before any motion
+             * deltas in boot mode (per 2026-05-07 IOHIDManager capture). */
+            static const uint8_t touch_on[8] = {
+                0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03
+            };
+            fprintf(stderr,
+                    "[AMT-DBG] synth touch-on frame (boot mode, first input)\n");
+            amt_enqueue(s, touch_on, sizeof(touch_on));
+            usb_wakeup(s->intr, 0);
+            s->finger_touching = true;
+        }
+        amt_emit_pointer_report(s);
+    }
 }
 
 static QemuInputHandler amt_input_handler = {
@@ -2319,7 +2389,10 @@ static void usb_apple_magic_tablet_realize(USBDevice *dev, Error **errp)
 
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
-    s->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
+    /* Cursor reports flow on Interface 1 EP3 (matches real device pcap
+     * 2026-05-09). EP1 is Interface 0 (vendor reports / battery — NAK'd
+     * in v1 since we don't drive that interface). */
+    s->intr = usb_ep_get(dev, USB_TOKEN_IN, 3);
 
     s->q_head = 0;
     s->q_tail = 0;
@@ -2332,6 +2405,7 @@ static void usb_apple_magic_tablet_realize(USBDevice *dev, Error **errp)
     s->finger_touching = false;
     s->trackpad_x = 0;        /* centred trackpad-coord position */
     s->trackpad_y = 0;
+    s->multitouch_enabled = false;  /* host issues SET_REPORT to flip */
 
     /*
      * Heartbeat disabled: the boot-mouse Trackpad/Boot interface descriptor
@@ -2379,6 +2453,8 @@ static void usb_apple_magic_tablet_handle_reset(USBDevice *dev)
     s->pending_event = false;
     s->last_abs_x = -1;
     s->last_abs_y = -1;
+    s->finger_touching = false;
+    s->multitouch_enabled = false;  /* host must SET_REPORT-enable again */
 }
 
 static void usb_apple_magic_tablet_handle_control(USBDevice *dev, USBPacket *p,
@@ -2400,11 +2476,40 @@ static void usb_apple_magic_tablet_handle_control(USBDevice *dev, USBPacket *p,
     switch (request) {
     case InterfaceRequest | USB_REQ_GET_DESCRIPTOR:
         if ((value >> 8) == 0x22) {
-            uint16_t rd_len = sizeof(apple_magic_tablet_hid_report_descriptor);
-            uint16_t copy = length < rd_len ? length : rd_len;
-            memcpy(data, apple_magic_tablet_hid_report_descriptor, copy);
-            p->actual_length = copy;
-            return;
+            /* HID Report Descriptor request — dispatch by interface index
+             * (wIndex). Real device has four interfaces with distinct
+             * report descriptors. */
+            const uint8_t *desc = NULL;
+            uint16_t rd_len = 0;
+            switch (index) {
+            case 0:
+                desc = amt_iface0_report_desc;
+                rd_len = sizeof(amt_iface0_report_desc);
+                break;
+            case 1:
+                desc = amt_iface1_report_desc;
+                rd_len = sizeof(amt_iface1_report_desc);
+                break;
+            case 2:
+                desc = amt_iface2_report_desc;
+                rd_len = sizeof(amt_iface2_report_desc);
+                break;
+            case 3:
+                desc = amt_iface3_report_desc;
+                rd_len = sizeof(amt_iface3_report_desc);
+                break;
+            default:
+                break;
+            }
+            if (desc) {
+                uint16_t copy = length < rd_len ? length : rd_len;
+                memcpy(data, desc, copy);
+                p->actual_length = copy;
+                fprintf(stderr,
+                        "[AMT-DBG] GET_HID_REPORT_DESC iface=%d len=%u\n",
+                        index, copy);
+                return;
+            }
         }
         break;
     case HID_GET_IDLE:
@@ -2425,7 +2530,7 @@ static void usb_apple_magic_tablet_handle_control(USBDevice *dev, USBPacket *p,
          * zero-filled payload of the declared per-Report-ID size so
          * macOS HID feature-report probes don't tight-loop on STALL.
          *
-         * Report 0x90 (battery, declared in descriptor collection #2)
+         * Report 0x90 (battery, declared in Interface 0 descriptor)
          * gets a real "100% on AC, not charging" payload — without it,
          * macOS' battery-aware code path may decline to fully arm the
          * device. 2 bytes per descriptor: byte0 = 3 status bits +
@@ -2454,15 +2559,39 @@ static void usb_apple_magic_tablet_handle_control(USBDevice *dev, USBPacket *p,
         p->actual_length = reply_len;
         return;
     }
-    case HID_SET_REPORT:
+    case HID_SET_REPORT: {
         /*
-         * Silently accept SET_REPORT writes. macOS' multitouch enable
-         * (per Linux hid-magicmouse.c: SET_REPORT type=feature, payload
-         * { 0x02, 0x01 } for Trackpad 2 USB) is the prime candidate but
-         * we don't currently switch report formats based on it; v1
-         * stays on the boot-mouse face.
+         * MULTITOUCH ENABLE detection. macOS' multitouch driver issues:
+         *   bmRequestType=0x21 bRequest=0x09 (HID_SET_REPORT)
+         *   wValue=0x0302  (high=0x03 type=feature, low=0x02 report ID)
+         *   wIndex=0x0001  (interface 1)
+         *   wLength=2, payload = { 0x02, 0x01 }
+         * Verified on real Magic Trackpad 2026-05-09 (USB pcap + Linux
+         * hid-magicmouse `feature_mt_trackpad2_usb[]`). When we see this,
+         * flip multitouch_enabled — subsequent input events are emitted
+         * as Report 0x44 multitouch frames on Interface 1 EP3 instead of
+         * 8-byte Report 0x02 boot-mouse frames.
          */
+        uint8_t report_type = (value >> 8) & 0xff;
+        uint8_t report_id   = value & 0xff;
+        if (report_type == 0x03 && report_id == 0x02 &&
+            index == 1 && length >= 2 &&
+            data[0] == 0x02 && data[1] == 0x01) {
+            USBAppleMagicTabletState *s = USB_APPLE_MAGIC_TABLET(dev);
+            s->multitouch_enabled = true;
+            fprintf(stderr,
+                    "[AMT-DBG] *** MULTITOUCH ENABLED via SET_REPORT "
+                    "(feature, ID=0x02, payload {0x02,0x01}) on iface 1\n");
+        } else {
+            fprintf(stderr,
+                    "[AMT-DBG] SET_REPORT type=0x%02x ID=0x%02x iface=%d "
+                    "len=%d data[0]=0x%02x data[1]=0x%02x\n",
+                    report_type, report_id, index, length,
+                    length >= 1 ? data[0] : 0,
+                    length >= 2 ? data[1] : 0);
+        }
         return;
+    }
     case VendorDeviceOutRequest | 0x40:
         /*
          * Apple vendor command (observed value=0x0514 idx=0x0320 len=0).
@@ -2482,11 +2611,20 @@ static void usb_apple_magic_tablet_handle_data(USBDevice *dev, USBPacket *p)
 {
     USBAppleMagicTabletState *s = USB_APPLE_MAGIC_TABLET(dev);
 
-    if (p->pid == USB_TOKEN_IN && p->ep->nr == 1) {
+    /*
+     * Endpoint dispatch — real device has four HID interfaces; we route
+     * by endpoint number:
+     *   EP1 IN  (Interface 0): vendor reports / battery — NAK forever
+     *   EP3 IN  (Interface 1): cursor reports (Report 0x02 or 0x44)
+     *   EP4 IN  (Interface 2): vendor 0x0d input — NAK forever
+     *   EP4 OUT (Interface 2): vendor 0x0d output — silently drain
+     *   EP5 IN  (Interface 3): vendor 0x03 input — NAK forever
+     */
+    if (p->pid == USB_TOKEN_IN && p->ep->nr == 3) {
         if (amt_q_empty(s)) {
             static unsigned nak_count;
             if ((++nak_count % 50) == 1) {
-                fprintf(stderr, "[AMT-DBG] IN ep1 NAK #%u (queue empty)\n",
+                fprintf(stderr, "[AMT-DBG] IN ep3 NAK #%u (queue empty)\n",
                         nak_count);
             }
             p->status = USB_RET_NAK;
@@ -2495,13 +2633,30 @@ static void usb_apple_magic_tablet_handle_data(USBDevice *dev, USBPacket *p)
         USBAppleMagicTabletReport *r = &s->queue[s->q_tail];
         s->q_tail = (s->q_tail + 1) & (AMT_QUEUE_DEPTH - 1);
         fprintf(stderr,
-                "[AMT-DBG] IN ep1 deliver len=%u rid=0x%02x dx=%d dy=%d\n",
-                r->len, r->data[0],
-                r->len >= 4 ? (int8_t)r->data[2] : 0,
-                r->len >= 4 ? (int8_t)r->data[3] : 0);
+                "[AMT-DBG] IN ep3 deliver len=%u rid=0x%02x mt_enabled=%d\n",
+                r->len, r->data[0], s->multitouch_enabled);
         usb_packet_copy(p, r->data, r->len);
         return;
     }
+
+    /* All other IN endpoints just NAK — driver polls them but we don't
+     * generate input on those interfaces in v1. */
+    if (p->pid == USB_TOKEN_IN) {
+        p->status = USB_RET_NAK;
+        return;
+    }
+
+    /* OUT on EP4 (Interface 2 vendor 0x0d output) — silently drain.
+     * macOS may push Report 0x53 firmware/config bytes here; we ignore
+     * them (v1 doesn't simulate the vendor-cmd target side). */
+    if (p->pid == USB_TOKEN_OUT && p->ep->nr == 4) {
+        fprintf(stderr,
+                "[AMT-DBG] OUT ep4 drain %u bytes (vendor 0x0d)\n",
+                p->iov.size);
+        p->actual_length = p->iov.size;
+        return;
+    }
+
     fprintf(stderr, "[AMT-DBG] handle_data UNEXPECTED pid=%d ep=%d -> STALL\n",
             p->pid, p->ep->nr);
     p->status = USB_RET_STALL;
