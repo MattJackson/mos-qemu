@@ -1788,7 +1788,40 @@ static const USBDescStrings desc_strings_amt = {
  * descriptor; without them the driver's start path stalls
  * IOHIDInterface during ::start.
  */
+/*
+ * Magic Trackpad 2 USB report descriptor.
+ *
+ * Real device declares FOUR application collections (visible in macOS ioreg
+ * as four separate IOHIDDevice instances under one parent USB device). When
+ * we declared only the Mouse-bearing collection (~110 bytes), the multitouch
+ * driver bound (PID/VID match) but refused to drive the cursor — macOS
+ * apparently treats a Magic Trackpad with missing companion collections as
+ * "incomplete hardware" and parks the pointer pipe.
+ *
+ * Collections, byte-for-byte from
+ * paravirt-re/library/apple-magic-hid/captures/magic-trackpad-usb-2026-05-06:
+ *
+ *   #1 [PRESENT BELOW]   Mouse + Digitizer + Vendor 0xff00/0x0c (110 B)
+ *                        Reports 0x02 (boot mouse, 8 B), 0x3f (digitizer 16 B),
+ *                        0x44 (vendor multitouch raw, 1387 B).
+ *
+ *   #2 [APPENDED BELOW]  Vendor 0xff00/0x0b + Vendor 0xff00/0x14 (45 B)
+ *                        Reports 0xe0 / 0x9a (vendor) + 0x90 (battery: AC,
+ *                        charging, needsReplace, %).
+ *                        AppleDeviceManagementHIDEventService binds here.
+ *
+ *   #3 [SKIPPED]         Vendor 0xff00/0x0d (35 B). Reports 0x3f (15 B input)
+ *                        and 0x53 (63 B feature). SKIPPED — Report 0x3f
+ *                        collides with the digitizer 0x3f in #1; Report IDs
+ *                        are global per USB interface.
+ *
+ *   #4 [APPENDED BELOW]  Vendor 0xff00/0x03 (27 B). Report 0xc0 (107 B input).
+ *
+ * Collection #1 stays first so PrimaryUsagePage=1 (Generic Desktop) — the
+ * matching attribute the multitouch driver looks for.
+ */
 static const uint8_t apple_magic_tablet_hid_report_descriptor[] = {
+    /* === Collection #1: Mouse + Digitizer + Vendor 0xff00/0x0c (110 B) === */
     0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01,
     0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
     0x15, 0x00, 0x25, 0x01, 0x85, 0x02, 0x95, 0x03,
@@ -1803,6 +1836,26 @@ static const uint8_t apple_magic_tablet_hid_report_descriptor[] = {
     0xa1, 0x01, 0x06, 0x00, 0xff, 0x09, 0x0c, 0x15,
     0x00, 0x26, 0xff, 0x00, 0x85, 0x44, 0x75, 0x08,
     0x96, 0x6b, 0x05, 0x81, 0x00, 0xc0,
+    /* === Collection #2: Vendor 0xff00/0x0b + 0x14 (45 B) ===
+     * Reports 0xe0 (vendor 4 B), 0x9a (vendor 1 B),
+     *         0x90 (AC mains + charging + needs-replace + battery %). */
+    0x06, 0x00, 0xff, 0x09, 0x0b, 0xa1, 0x01, 0x06,
+    0x00, 0xff, 0x09, 0x0b, 0x15, 0x00, 0x26, 0xff,
+    0x00, 0x75, 0x08, 0x96, 0x04, 0x00, 0x85, 0xe0,
+    0x81, 0x22, 0x09, 0x0b, 0x96, 0x01, 0x00, 0x85,
+    0x9a, 0x81, 0x22, 0xc0, 0x06, 0x00, 0xff, 0x09,
+    0x14, 0xa1, 0x01, 0x85, 0x90, 0x05, 0x84, 0x75,
+    0x01, 0x95, 0x03, 0x15, 0x00, 0x25, 0x01, 0x09,
+    0x61, 0x05, 0x85, 0x09, 0x44, 0x09, 0x46, 0x81,
+    0x02, 0x95, 0x05, 0x81, 0x01, 0x75, 0x08, 0x95,
+    0x01, 0x15, 0x00, 0x26, 0xff, 0x00, 0x09, 0x65,
+    0x81, 0x02, 0xc0,
+    /* === Collection #4: Vendor 0xff00/0x03 (27 B) ===
+     * Report 0xc0 (107 B input, purpose unknown). */
+    0x06, 0x00, 0xff, 0x09, 0x03, 0xa1, 0x01, 0x06,
+    0x00, 0xff, 0x09, 0x03, 0x15, 0x00, 0x26, 0xff,
+    0x00, 0x85, 0xc0, 0x96, 0x6b, 0x00, 0x75, 0x08,
+    0x81, 0x02, 0xc0,
 };
 
 static const USBDescIface desc_iface_apple_magic_tablet = {
@@ -2277,10 +2330,21 @@ static void usb_apple_magic_tablet_handle_control(USBDevice *dev, USBPacket *p,
     }
     case HID_SET_REPORT:
         /*
-         * Silently accept SET_REPORT writes. macOS sends a vendor
-         * "enable mode 4" SET_REPORT after enumeration to switch the
-         * device into multitouch mode; this emulator stays on the
-         * boot-mouse face regardless and does not act on it yet.
+         * Silently accept SET_REPORT writes. macOS' multitouch enable
+         * (per Linux hid-magicmouse.c: SET_REPORT type=feature, payload
+         * { 0x02, 0x01 } for Trackpad 2 USB) is the prime candidate but
+         * we don't currently switch report formats based on it; v1
+         * stays on the boot-mouse face.
+         */
+        return;
+    case VendorDeviceOutRequest | 0x40:
+        /*
+         * Apple vendor command (observed value=0x0514 idx=0x0320 len=0).
+         * macOS issues this twice: once after enumeration, once after
+         * the first IN-endpoint poll. STALLing it caused the HID layer
+         * to lock IN polling. The Linux hid-magicmouse driver does NOT
+         * issue this command, so this is a macOS-specific init step
+         * (real device must ack it). Silently accept.
          */
         return;
     }
