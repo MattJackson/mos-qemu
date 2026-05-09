@@ -86,6 +86,7 @@ typedef struct AppleGFXLinuxState {
     uint32_t rendering_frame_width;
     uint32_t rendering_frame_height;
     QEMUTimer vblank_timer;
+    bool initial_surface_pushed;
 
     /* Reference to option ROM path (unused on Linux: the PCI core loads the
      * ROM directly via PCIDeviceClass::romfile; see apple-gfx-pci-linux.c). */
