@@ -1878,8 +1878,11 @@ static const USBDesc desc_apple_magic_tablet = {
     .str  = desc_strings_amt,
 };
 
-/* Maximum queued boot-mouse reports waiting for the host to poll EP1. */
-#define AMT_QUEUE_DEPTH      16
+/* Maximum queued boot-mouse reports waiting for the host to poll EP1.
+ * Must be a power of two. With dx/dy clamped to int8, a single large
+ * VNC pointer move (e.g. 2000 px) drains across ~16 reports — bumping
+ * to 64 keeps headroom for fast motion. */
+#define AMT_QUEUE_DEPTH      64
 #define AMT_REPORT_LEN       3      /* boot mouse: button + dx + dy */
 
 typedef struct USBAppleMagicTabletReport {
@@ -2026,7 +2029,16 @@ static void amt_input_event(DeviceState *dev, QemuConsole *src,
     }
 }
 
-/* QemuInputHandler.sync — flush a boot-mouse 3-byte report if anything moved. */
+/* QemuInputHandler.sync — drain pending_dx/dy in 3-byte boot-mouse reports.
+ *
+ * Each report's dx/dy is clamped to int8 (±127). Large motions (e.g.,
+ * a single VNC ABS event mapping to a 1000+ px delta after diffing
+ * against the prior absolute position) need multiple reports to drain.
+ * Loop until both axes are zero, queueing a report per iteration.
+ *
+ * Cap the loop at a reasonable max so a runaway delta can't lock us up;
+ * the queue depth + bInterval naturally back-pressure if the host falls
+ * behind. */
 static void amt_input_sync(DeviceState *dev)
 {
     USBAppleMagicTabletState *s = USB_APPLE_MAGIC_TABLET(dev);
@@ -2035,7 +2047,13 @@ static void amt_input_sync(DeviceState *dev)
         return;
     }
     s->pending_event = false;
-    amt_emit_boot_mouse(s);
+
+    /* Always emit at least once (catches button-only changes with no motion). */
+    int loops = 0;
+    do {
+        amt_emit_boot_mouse(s);
+        loops++;
+    } while ((s->pending_dx != 0 || s->pending_dy != 0) && loops < 64);
 }
 
 static QemuInputHandler amt_input_handler = {
