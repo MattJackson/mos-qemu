@@ -20,7 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
-#include "block/aio.h"
+#include "qemu/aio.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
 #include "hw/qdev-properties.h"
