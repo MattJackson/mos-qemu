@@ -1774,11 +1774,14 @@ static const USBDescStrings desc_strings_amt = {
  * Single interface, single IN endpoint, simple 3-byte boot-mouse reports.
  */
 
-/* Boot-mouse HID Report Descriptor — standard 3-byte report (no Report ID).
+/* Boot-mouse + scroll HID Report Descriptor — 5-byte report (no Report ID).
  *   byte 0: 3-bit button mask + 5-bit padding
  *   byte 1: signed int8 dX
  *   byte 2: signed int8 dY
- * macOS' generic IOHIDPointing parses this without quirks. */
+ *   byte 3: signed int8 vertical wheel
+ *   byte 4: signed int8 horizontal wheel (Mighty Mouse scroll ball X)
+ * macOS' generic mouse driver parses this without quirks; this is the
+ * standard layout for any USB HID mouse with a scroll wheel/ball. */
 static const uint8_t amt_boot_mouse_report_desc[] = {
     0x05, 0x01,             /* Usage Page (Generic Desktop) */
     0x09, 0x02,             /* Usage (Mouse) */
@@ -1799,11 +1802,19 @@ static const uint8_t amt_boot_mouse_report_desc[] = {
         0x05, 0x01,         /*     Usage Page (Generic Desktop) */
         0x09, 0x30,         /*     Usage (X) */
         0x09, 0x31,         /*     Usage (Y) */
+        0x09, 0x38,         /*     Usage (Wheel — vertical) */
         0x15, 0x81,         /*     Logical Min (-127) */
         0x25, 0x7f,         /*     Logical Max (127) */
         0x75, 0x08,         /*     Report Size (8) */
-        0x95, 0x02,         /*     Report Count (2) */
-        0x81, 0x06,         /*     Input (Data, Var, Rel) — 2 signed bytes */
+        0x95, 0x03,         /*     Report Count (3) */
+        0x81, 0x06,         /*     Input (Data, Var, Rel) — X, Y, Wheel */
+        0x05, 0x0c,         /*     Usage Page (Consumer) */
+        0x0a, 0x38, 0x02,   /*     Usage (AC Pan — horizontal scroll) */
+        0x15, 0x81,         /*     Logical Min (-127) */
+        0x25, 0x7f,         /*     Logical Max (127) */
+        0x75, 0x08,         /*     Report Size (8) */
+        0x95, 0x01,         /*     Report Count (1) */
+        0x81, 0x06,         /*     Input (Data, Var, Rel) — HWheel */
       0xc0,                 /*   End Collection (Physical) */
     0xc0,                   /* End Collection (Application) */
 };
@@ -1883,7 +1894,7 @@ static const USBDesc desc_apple_magic_tablet = {
  * VNC pointer move (e.g. 2000 px) drains across ~16 reports — bumping
  * to 64 keeps headroom for fast motion. */
 #define AMT_QUEUE_DEPTH      64
-#define AMT_REPORT_LEN       3      /* boot mouse: button + dx + dy */
+#define AMT_REPORT_LEN       5      /* button + dx + dy + wheel + hwheel */
 
 typedef struct USBAppleMagicTabletReport {
     uint8_t data[AMT_REPORT_LEN];
@@ -1896,7 +1907,11 @@ typedef struct USBAppleMagicTabletState {
     /* Pending input accumulation (drained on .sync). */
     int32_t  pending_dx;
     int32_t  pending_dy;
+    int32_t  pending_wheel;     /* vertical scroll, REL clicks */
+    int32_t  pending_hwheel;    /* horizontal scroll, REL clicks */
     bool     button_left;
+    bool     button_right;
+    bool     button_middle;
     bool     pending_event;
 
     /* ABS→REL conversion state (VNC/SPICE/SDL deliver ABS). -1 = none yet. */
@@ -1963,16 +1978,21 @@ static void amt_emit_boot_mouse(USBAppleMagicTabletState *s)
     uint8_t buf[AMT_REPORT_LEN];
     int8_t dx = amt_clamp_i8(s->pending_dx);
     int8_t dy = amt_clamp_i8(s->pending_dy);
+    int8_t wheel = amt_clamp_i8(s->pending_wheel);
+    int8_t hwheel = amt_clamp_i8(s->pending_hwheel);
 
     s->pending_dx -= dx;
     s->pending_dy -= dy;
+    s->pending_wheel -= wheel;
+    s->pending_hwheel -= hwheel;
 
-    buf[0] = s->button_left ? 0x01 : 0x00;
+    buf[0] = (s->button_left   ? 0x01 : 0x00) |
+             (s->button_right  ? 0x02 : 0x00) |
+             (s->button_middle ? 0x04 : 0x00);
     buf[1] = (uint8_t)dx;
     buf[2] = (uint8_t)dy;
-
-    fprintf(stderr, "[AMT-DBG] emit boot-mouse dx=%d dy=%d btn=%d\n",
-            dx, dy, s->button_left);
+    buf[3] = (uint8_t)wheel;
+    buf[4] = (uint8_t)hwheel;
 
     amt_enqueue(s, buf);
     usb_wakeup(s->intr, 0);
@@ -2018,9 +2038,45 @@ static void amt_input_event(DeviceState *dev, QemuConsole *src,
     }
     case INPUT_EVENT_KIND_BTN: {
         InputBtnEvent *btn = evt->u.btn.data;
-        if (btn->button == INPUT_BUTTON_LEFT) {
+        switch (btn->button) {
+        case INPUT_BUTTON_LEFT:
             s->button_left = btn->down;
             s->pending_event = true;
+            break;
+        case INPUT_BUTTON_RIGHT:
+            s->button_right = btn->down;
+            s->pending_event = true;
+            break;
+        case INPUT_BUTTON_MIDDLE:
+            s->button_middle = btn->down;
+            s->pending_event = true;
+            break;
+        case INPUT_BUTTON_WHEEL_UP:
+            if (btn->down) {
+                s->pending_wheel += 1;
+                s->pending_event = true;
+            }
+            break;
+        case INPUT_BUTTON_WHEEL_DOWN:
+            if (btn->down) {
+                s->pending_wheel -= 1;
+                s->pending_event = true;
+            }
+            break;
+        case INPUT_BUTTON_WHEEL_LEFT:
+            if (btn->down) {
+                s->pending_hwheel -= 1;
+                s->pending_event = true;
+            }
+            break;
+        case INPUT_BUTTON_WHEEL_RIGHT:
+            if (btn->down) {
+                s->pending_hwheel += 1;
+                s->pending_event = true;
+            }
+            break;
+        default:
+            break;
         }
         break;
     }
@@ -2053,7 +2109,8 @@ static void amt_input_sync(DeviceState *dev)
     do {
         amt_emit_boot_mouse(s);
         loops++;
-    } while ((s->pending_dx != 0 || s->pending_dy != 0) && loops < 64);
+    } while ((s->pending_dx != 0 || s->pending_dy != 0 ||
+              s->pending_wheel != 0 || s->pending_hwheel != 0) && loops < 64);
 }
 
 static QemuInputHandler amt_input_handler = {
@@ -2079,7 +2136,8 @@ static void usb_apple_magic_tablet_realize(USBDevice *dev, Error **errp)
 
     s->q_head = s->q_tail = 0;
     s->pending_dx = s->pending_dy = 0;
-    s->button_left = false;
+    s->pending_wheel = s->pending_hwheel = 0;
+    s->button_left = s->button_right = s->button_middle = false;
     s->last_abs_x = -1;
     s->last_abs_y = -1;
     s->pending_event = false;
@@ -2107,7 +2165,8 @@ static void usb_apple_magic_tablet_handle_reset(USBDevice *dev)
 
     s->q_head = s->q_tail = 0;
     s->pending_dx = s->pending_dy = 0;
-    s->button_left = false;
+    s->pending_wheel = s->pending_hwheel = 0;
+    s->button_left = s->button_right = s->button_middle = false;
     s->pending_event = false;
     s->last_abs_x = -1;
     s->last_abs_y = -1;
