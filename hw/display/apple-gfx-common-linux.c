@@ -504,6 +504,7 @@ static void
 apple_gfx_vblank_tick(void *opaque)
 {
     AppleGFXLinuxState *s = opaque;
+    trace_apple_gfx_vblank_tick();
     if (!s->initial_surface_pushed) {
         dpy_gfx_update_full(s->con);
         s->initial_surface_pushed = true;
