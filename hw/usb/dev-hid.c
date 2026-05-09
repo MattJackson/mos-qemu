@@ -1701,40 +1701,14 @@ static const TypeInfo usb_apple_magic_kbd_info = {
 
 
 /*
- * apple-magic-tablet
- * ------------------
+ * apple-mighty-mouse (USB type name; legacy alias `apple-magic-tablet`)
+ * --------------------------------------------------------------------
  *
- * USB-mode emulator for the Apple Magic Trackpad 2 (idVendor 0x05ac,
- * idProduct 0x0265). Descriptors and HID report descriptors are
- * byte-identical to a real device captured in USB-cable mode (two
- * HID interfaces: vendor "Device Management" + boot "Trackpad / Boot",
- * matching the real device's IOReg layout).
- *
- * Boot-interface input reports:
- *   RID 0x02  8 bytes  02 BB DX DY 00 00 00 00
- *                                         — boot-mouse pointer frame:
- *     BB = button     (bit 0 = left click, bits 1-2 right/middle)
- *     DX = int8 dX    signed per-frame delta (~66Hz cadence)
- *     DY = int8 dY    signed per-frame delta
- *     [4..7] = reserved (0)
- *
- * This is the "USB boot mouse" face of the trackpad. The vendor
- * multitouch protocol (per-finger absolute positions, RID 0x3f /
- * RID 0x44) is gated behind a vendor SET_REPORT macOS sends after
- * enumeration. v1 emulates only the boot face: cursor motion + left
- * click, which is enough for macOS to bind AppleUSBTopCaseHIDDriver
- * + AppleMultitouchTrackpadHIDEventDriver and present a real Apple
- * pointing device (not the generic usb-tablet that breaks recovery).
- *
- * QEMU input subsystem wiring:
- *   - Registers a QemuInputHandler accepting REL motion + ABS motion
- *     + BTN events. ABS events (from VNC) are converted to REL via a
- *     last_abs_x/y delta tracker, since the boot-mouse report only
- *     carries int8 dX/dY.
- *   - Accumulates dx/dy across input frames; flushes one Report 0x02
- *     frame from the .sync callback per input batch.
- *   - Independent 1Hz timer emits a battery-status heartbeat on the
- *     vendor interface (Report 0x52 / 0x90 family).
+ * Internal symbols carry the historic `amt` / `apple_magic_tablet` /
+ * `USBAppleMagicTabletState` prefixes — kept to minimize diff churn
+ * since this file's user-facing identity flipped during the 2026-05-09
+ * fresh-eyes rewrite (see header below). Only the `-device` string and
+ * vmstate name are user-visible and were renamed.
  */
 
 enum {
@@ -1752,7 +1726,7 @@ static const USBDescStrings desc_strings_amt = {
 };
 
 /*
- * apple-magic-tablet device — FRESH-EYES REWRITE 2026-05-09.
+ * apple-mighty-mouse device — FRESH-EYES REWRITE 2026-05-09.
  *
  * Goal: macOS sees a USB HID mouse from Apple that "just works" for cursor
  * motion. Not Magic Trackpad multitouch — that path needs deep RE we don't
@@ -1927,7 +1901,18 @@ typedef struct USBAppleMagicTabletState {
     QemuInputHandlerState *input_handler;
 } USBAppleMagicTabletState;
 
-#define TYPE_USB_APPLE_MAGIC_TABLET "apple-magic-tablet"
+/*
+ * Canonical type name is `apple-mighty-mouse` (this device emulates Apple
+ * Mighty Mouse PID 0x0304 — the wired ball mouse). Historic name
+ * `apple-magic-tablet` predates the 2026-05-09 fresh-eyes rewrite and is
+ * preserved as a legacy alias (registered below) for in-tree mos-docker
+ * `test.sh` back-compat. Internal symbols (`USBAppleMagicTabletState`,
+ * `usb_apple_magic_tablet_*`, `USB_APPLE_MAGIC_TABLET()` cast) keep their
+ * historic names to minimize diff churn — the rename is purely the
+ * user-facing `-device` string.
+ */
+#define TYPE_USB_APPLE_MAGIC_TABLET "apple-mighty-mouse"
+#define TYPE_USB_APPLE_MAGIC_TABLET_LEGACY "apple-magic-tablet"
 OBJECT_DECLARE_SIMPLE_TYPE(USBAppleMagicTabletState, USB_APPLE_MAGIC_TABLET)
 
 static inline unsigned amt_q_count(USBAppleMagicTabletState *s)
@@ -2243,7 +2228,7 @@ static void usb_apple_magic_tablet_handle_data(USBDevice *dev, USBPacket *p)
 }
 
 static const VMStateDescription vmstate_apple_magic_tablet = {
-    .name = "apple-magic-tablet",
+    .name = "apple-mighty-mouse",
     .unmigratable = 1,
 };
 
@@ -2273,6 +2258,18 @@ static const TypeInfo usb_apple_magic_tablet_info = {
     .class_init    = usb_apple_magic_tablet_class_initfn,
 };
 
+/*
+ * Legacy alias: `-device apple-magic-tablet` resolves to the same Mighty
+ * Mouse implementation. Inheriting via .parent reuses the parent's
+ * class_init and instance_size — no code duplication. Drop this alias
+ * after all in-tree consumers (mos-docker test.sh TABLET_DEVICE env) move
+ * to the canonical `apple-mighty-mouse`.
+ */
+static const TypeInfo usb_apple_magic_tablet_legacy_info = {
+    .name   = TYPE_USB_APPLE_MAGIC_TABLET_LEGACY,
+    .parent = TYPE_USB_APPLE_MAGIC_TABLET,
+};
+
 static void usb_hid_register_types(void)
 {
     type_register_static(&usb_hid_type_info);
@@ -2284,6 +2281,7 @@ static void usb_hid_register_types(void)
     usb_legacy_register("usb-kbd", "keyboard", NULL);
     type_register_static(&usb_apple_magic_kbd_info);
     type_register_static(&usb_apple_magic_tablet_info);
+    type_register_static(&usb_apple_magic_tablet_legacy_info);
 }
 
 type_init(usb_hid_register_types)
