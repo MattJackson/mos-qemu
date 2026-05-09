@@ -207,7 +207,22 @@ apple_gfx_map_memory(void *opaque, lagfx_task_t *task,
     AppleGFXLinuxState *s = opaque;
     AppleGFXLinuxTask *linux_task = NULL;
     AppleGFXLinuxTask *it;
+    /*
+     * Track per-range state for proper unwind on partial failure:
+     *  - mapped[i]:    lagfx_task_map_host_memory succeeded for this range
+     *                  (so it must be unmapped on rollback).
+     *  - new_region[i]: the MemoryRegion was first ref'd by *this* call
+     *                   (so its ref must be dropped on rollback). A region
+     *                   already in linux_task->mapped_regions before we
+     *                   started keeps its existing ref.
+     */
+    g_autofree bool *mapped = g_new0(bool, range_count > 0 ? range_count : 1);
+    g_autofree MemoryRegion **new_region =
+        g_new0(MemoryRegion *, range_count > 0 ? range_count : 1);
+    uint64_t base_virtual_offset = virtual_offset;
+    uint64_t cur_virtual_offset = virtual_offset;
     bool success = true;
+    size_t fail_index = 0;
 
     trace_apple_gfx_map_memory(task, range_count, virtual_offset, read_only);
 
@@ -244,25 +259,49 @@ apple_gfx_map_memory(void *opaque, lagfx_task_t *task,
                           " len 0x%" PRIx64 " not directly accessible\n",
                           range->guest_physical_address, range->length);
             success = false;
-            virtual_offset += range->length;
-            continue;
+            fail_index = i;
+            break;
         }
 
+        /* Take a fresh ref only the first time we see this region in
+         * this task; track it so we can drop it on rollback. */
         if (!g_ptr_array_find(linux_task->mapped_regions, region, NULL)) {
             g_ptr_array_add(linux_task->mapped_regions, region);
             memory_region_ref(region);
+            new_region[i] = region;
         }
 
-        if (!lagfx_task_map_host_memory(task, virtual_offset, host_ptr,
+        if (!lagfx_task_map_host_memory(task, cur_virtual_offset, host_ptr,
                                          range->length, read_only)) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "apple-gfx: lagfx_task_map_host_memory failed"
                           " at task_offset=0x%" PRIx64 " len=0x%" PRIx64 "\n",
-                          virtual_offset, range->length);
+                          cur_virtual_offset, range->length);
             success = false;
+            fail_index = i;
+            break;
         }
+        mapped[i] = true;
+        cur_virtual_offset += range->length;
+    }
 
-        virtual_offset += range->length;
+    if (!success) {
+        /* Roll back everything done in this call so the caller sees an
+         * all-or-nothing map. */
+        uint64_t rollback_offset = base_virtual_offset;
+        for (size_t i = 0; i < fail_index; i++) {
+            if (mapped[i]) {
+                lagfx_task_unmap(task, rollback_offset, ranges[i].length);
+            }
+            rollback_offset += ranges[i].length;
+        }
+        for (size_t i = 0; i <= fail_index && i < range_count; i++) {
+            if (new_region[i]) {
+                g_ptr_array_remove_fast(linux_task->mapped_regions,
+                                        new_region[i]);
+                memory_region_unref(new_region[i]);
+            }
+        }
     }
 
     return success;
@@ -431,35 +470,58 @@ static void
 apple_gfx_vblank_tick(void *opaque)
 {
     AppleGFXLinuxState *s = opaque;
+
     trace_apple_gfx_vblank_tick();
+
+    /* Tick may have been queued before unrealize completed; lagfx_dev
+     * is NULLed on teardown — skip the call to avoid a UAF. */
+    if (!s->lagfx_dev) {
+        return;
+    }
+
     if (!s->initial_surface_pushed) {
         dpy_gfx_update_full(s->con);
         s->initial_surface_pushed = true;
+    }
+
+    lagfx_display_tick_vblank(s->lagfx_dev, s,
+                              apple_gfx_write_memory, apple_gfx_read_memory);
+    timer_mod(&s->vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NANOSECONDS_PER_SECOND / 60);
 }
-     lagfx_display_tick_vblank(s->lagfx_dev, s,
-                               apple_gfx_write_memory, apple_gfx_read_memory);
-     timer_mod(&s->vblank_timer,
-               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-               NANOSECONDS_PER_SECOND / 60);
- }
 
- static void
- apple_gfx_frame_ready(void *opaque)
- {
-     AppleGFXLinuxState *s = opaque;
+static void
+apple_gfx_frame_ready(void *opaque)
+{
+    AppleGFXLinuxState *s = opaque;
+    uint32_t prev;
 
-/* Cap pending at 2: cmpxchg(0,1) succeeds only when value==0.
- * If we see >=1, another thread is handling or we're capped. */
-uint32_t prev = qatomic_cmpxchg(&s->pending_frames, 0, 1);
-     if (prev != 0 || qatomic_read(&s->pending_frames) > 1) {
-         return;
-     }
+    /* Cap pending at 2 with two-step cmpxchg.
+     *  - cmpxchg(0,1): no work in flight, schedule one BH.
+     *  - cmpxchg(1,2): one in flight, queue exactly one more.
+     *  - prev >= 2:    already capped, drop this notification.
+     * Both reads come from cmpxchg's atomic return value — never a
+     * non-atomic re-read of pending_frames. */
+    prev = qatomic_cmpxchg(&s->pending_frames, 0, 1);
+    if (prev != 0) {
+        prev = qatomic_cmpxchg(&s->pending_frames, 1, 2);
+        if (prev != 1) {
+            /* prev was 0 (a concurrent caller already drained), or
+             * prev was >=2 (already at cap). Either way: nothing to do. */
+            return;
+        }
+        /* We bumped 1 -> 2; the in-flight BH will reschedule itself
+         * via the tail of apple_gfx_frame_ready_bh, so don't schedule
+         * another one here. */
+        return;
+    }
 
-     trace_apple_gfx_new_frame();
+    trace_apple_gfx_new_frame();
 
-     aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                             apple_gfx_frame_ready_bh, opaque);
- }
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            apple_gfx_frame_ready_bh, opaque);
+}
 
 static void
 apple_gfx_mode_changed(void *opaque, uint32_t width_px, uint32_t height_px)
@@ -525,8 +587,8 @@ apple_gfx_cursor_glyph(void *opaque,
     uint32_t *dest_px;
     const uint8_t *src_px;
 
-/* BPP is always 32 for QEMU cursors. */
-trace_apple_gfx_cursor_set(32, width, height);
+    /* BPP is always 32 for QEMU cursors. */
+    trace_apple_gfx_cursor_set(32, width, height);
 
     cursor = cursor_alloc(width, height);
     cursor->hot_x = hotspot.x;
@@ -693,43 +755,44 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
     disp_desc.callbacks.cursor_show = apple_gfx_cursor_show;
 
     static const GraphicHwOps apple_gfx_hw_ops = {
-         .gfx_update = NULL,
-         .gfx_update_async = true,
-     };
+        .gfx_update = NULL,
+        .gfx_update_async = true,
+    };
 
-     s->con = graphic_console_init(dev, 0, &apple_gfx_hw_ops, s);
+    s->con = graphic_console_init(dev, 0, &apple_gfx_hw_ops, s);
 
-     s->surface = qemu_create_displaysurface(1920, 1080);
-     dpy_gfx_replace_surface(s->con, s->surface);
+    s->surface = qemu_create_displaysurface(1920, 1080);
+    dpy_gfx_replace_surface(s->con, s->surface);
 
-     /* Create display — may synchronously call apple_gfx_mode_changed.
-      * Console + surface above must already be set. */
-     s->lagfx_disp = lagfx_display_new(s->lagfx_dev, &disp_desc,
-                                       0, /* port */
-                                       next_pgdisplay_serial_num++,
-                                       &errp_lagfx);
-if (!s->lagfx_disp) {
-          error_setg(errp, "Failed to create lagfx_display: %s",
-                     errp_lagfx ? errp_lagfx : "unknown");
+    /* Create display — may synchronously call apple_gfx_mode_changed.
+     * Console + surface above must already be set. */
+    s->lagfx_disp = lagfx_display_new(s->lagfx_dev, &disp_desc,
+                                      0, /* port */
+                                      next_pgdisplay_serial_num++,
+                                      &errp_lagfx);
+    if (!s->lagfx_disp) {
+        error_setg(errp, "Failed to create lagfx_display: %s",
+                   errp_lagfx ? errp_lagfx : "unknown");
 
-          /* Drop surface before console NULL — dpy_gfx_replace_surface(NULL)
-           * lets console own surface; then free it. */
-          if (s->con && s->surface) {
-              dpy_gfx_replace_surface(s->con, NULL);
-              qemu_free_displaysurface(s->surface);
-              s->surface = NULL;
-          }
+        /* dpy_gfx_replace_surface(NULL) takes ownership and frees the
+         * prior surface; do NOT call qemu_free_displaysurface() after
+         * it (double-free). */
+        if (s->con && s->surface) {
+            dpy_gfx_replace_surface(s->con, NULL);
+            s->surface = NULL;
+        }
 
-/* Unregister migration blocker — prevents stale blocker on retry. */
-migrate_del_blocker(&apple_gfx_mig_blocker);
+        /* Unregister migration blocker so a retry can re-add it. */
+        migrate_del_blocker(&apple_gfx_mig_blocker);
 
-/* NULL lagfx_dev to prevent UAF if apple_gfx_pci_reset runs. */
-s->lagfx_dev = NULL;
-          lagfx_device_free(s->lagfx_dev);
+        /* Free lagfx_dev *before* NULLing the field — passing NULL to
+         * lagfx_device_free would leak the underlying allocation. */
+        lagfx_device_free(s->lagfx_dev);
+        s->lagfx_dev = NULL;
 
-          g_free(errp_lagfx);
-         return false;
-     }
+        g_free(errp_lagfx);
+        return false;
+    }
 
     /* 60 Hz vblank tick. Also performs the initial dpy_gfx_update_full —
      * doing it from realize segfaults because VNC/SDL backends aren't
