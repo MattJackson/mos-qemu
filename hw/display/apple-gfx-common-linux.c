@@ -885,6 +885,12 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
 
     s->con = graphic_console_init(dev, 0, &apple_gfx_hw_ops, s);
 
+    /* Publish initial black surface immediately so GOP/OpenCore sees a display.
+     * Without this, UEFI firmware has no framebuffer to attach to and macOS
+     * never boots. This matches stdvga/vmware_vga behavior. */
+    s->surface = qemu_create_displaysurface(1920, 1080);
+    dpy_gfx_replace_surface(s->con, s->surface);
+
     /* VBlank timer: ticks at ~60 Hz to advance the guest's vblank
      * counter via lagfx_ops_display_tick_vblank(). WindowServer
      * waits on this counter before submitting display updates. */
