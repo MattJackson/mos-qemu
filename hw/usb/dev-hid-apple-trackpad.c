@@ -117,7 +117,25 @@ static const uint8_t amtp_iface3_report_desc[] = {
  * ------------------------------------------------------------------------ */
 
 #define AMTP_VID                0x05ac
-#define AMTP_PID                0x0265
+/*
+ * v3.0 PID escape: 0x0265 is "Magic Trackpad 2" — macOS' kext
+ * `AppleMultitouchTrackpadHIDEventDriver` has a PID-specific match on
+ * this value, and once bound its `handleInterruptReport` silently
+ * drops every report (parser-type=1000 expects an Apple-private
+ * OSDictionary built by `MultitouchHID.plugin` from the descriptor —
+ * see memory/research_apple_multitouch_parser_re.md). Using a
+ * different Apple PID (0x0266 — one off Magic Trackpad 2, not in any
+ * known multitouch match list) makes macOS fall through to generic
+ * `AppleHIDMouseEventDriver`, which consumes our boot-mouse Report
+ * 0x02 directly. Tradeoff: device is no longer "Magic Trackpad 2" in
+ * `system_profiler`, but the cursor actually moves.
+ *
+ * QEMU device name stays `apple-magic-trackpad` because the device
+ * implementation still emulates the Magic Trackpad 2 USB shape
+ * (4-iface composite, boot-mouse iface 1, vendor TopCase iface 0).
+ * Only the USB-host-visible PID is changed.
+ */
+#define AMTP_PID                0x0266
 #define AMTP_BCD_DEVICE         0x0871
 
 #define AMTP_EP_IFACE0_IN       1   /* 0x81 — vendor heartbeats */
@@ -310,6 +328,9 @@ typedef struct USBAppleMagicTrackpadState {
     int32_t  abs_y;
     int32_t  prev_abs_x;
     int32_t  prev_abs_y;
+    bool     prev_abs_valid;     /* false until first ABS event seen, so we
+                                  * don't compute a huge bogus delta from
+                                  * prev=(0,0) on the first emit. */
     bool     button_left;
     bool     finger_down;       /* edge-triggered: was a touch active last frame? */
     bool     pending_event;
@@ -529,16 +550,20 @@ static void amtp_input_sync(DeviceState *dev)
          * snappy cursor while keeping each delta within the int8 range
          * a boot-mouse report can carry. Larger pointer jumps in one
          * frame get clamped to ±127. */
-        int32_t dx_abs = s->abs_x - s->prev_abs_x;
-        int32_t dy_abs = s->abs_y - s->prev_abs_y;
-        int32_t dx = dx_abs / 4;
-        int32_t dy = dy_abs / 4;
-        if (dx > 127)  dx = 127;
-        if (dx < -127) dx = -127;
-        if (dy > 127)  dy = 127;
-        if (dy < -127) dy = -127;
+        int32_t dx = 0, dy = 0;
+        if (s->prev_abs_valid) {
+            int32_t dx_abs = s->abs_x - s->prev_abs_x;
+            int32_t dy_abs = s->abs_y - s->prev_abs_y;
+            dx = dx_abs / 4;
+            dy = dy_abs / 4;
+            if (dx > 127)  dx = 127;
+            if (dx < -127) dx = -127;
+            if (dy > 127)  dy = 127;
+            if (dy < -127) dy = -127;
+        }
         s->prev_abs_x = s->abs_x;
         s->prev_abs_y = s->abs_y;
+        s->prev_abs_valid = true;
         amtp_emit_boot_mouse(s, (int8_t)dx, (int8_t)dy,
                              s->button_left ? 0x01 : 0x00);
     }
@@ -565,6 +590,7 @@ static void usb_apple_magic_trackpad_handle_reset(USBDevice *dev)
     s->mt_seq             = 0;
     s->prev_abs_x         = 0;
     s->prev_abs_y         = 0;
+    s->prev_abs_valid     = false;
     s->q_head = s->q_tail = 0;
 }
 
