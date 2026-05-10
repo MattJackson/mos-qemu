@@ -302,9 +302,14 @@ typedef struct USBAppleMagicTrackpadState {
     bool multitouch_enabled;
 
     /* Single-pointer state from QEMU's input subsystem. VNC delivers ABS;
-     * we map (abs_x, abs_y) directly into trackpad-coordinate fingertip. */
+     * we map (abs_x, abs_y) directly into trackpad-coordinate fingertip.
+     * prev_abs_{x,y} feed boot-mouse abs→rel delta computation when the
+     * trackpad is still in pre-multitouch-enable mode (Report 0x02 boot
+     * mouse shape). */
     int32_t  abs_x;
     int32_t  abs_y;
+    int32_t  prev_abs_x;
+    int32_t  prev_abs_y;
     bool     button_left;
     bool     finger_down;       /* edge-triggered: was a touch active last frame? */
     bool     pending_event;
@@ -504,11 +509,27 @@ static void amtp_input_sync(DeviceState *dev)
     if (s->multitouch_enabled) {
         amtp_emit_multitouch(s);
     } else {
-        /* Pre-enable: emit boot-mouse style. We don't track ABS→REL deltas
-         * here for v1 — macOS' driver issues SET_REPORT very early in
-         * enumeration, so the boot-mouse window is essentially never used
-         * once the driver fully loads. */
-        amtp_emit_boot_mouse(s, 0, 0, s->button_left ? 0x01 : 0x00);
+        /* Pre-enable: boot-mouse Report 0x02 (8-byte shape: ID + button
+         * + dx + dy + 4B reserved). VNC delivers ABS only; convert to
+         * REL by tracking the previous-frame absolute and emitting the
+         * delta. Scale: VNC abs is 0..32767 across the screen width
+         * (~1080px on a 1920×1080 host), so 1px ≈ 30 abs units. We use
+         * a /4 divisor (≈ 7-8 abs units per dx unit) — this gives a
+         * snappy cursor while keeping each delta within the int8 range
+         * a boot-mouse report can carry. Larger pointer jumps in one
+         * frame get clamped to ±127. */
+        int32_t dx_abs = s->abs_x - s->prev_abs_x;
+        int32_t dy_abs = s->abs_y - s->prev_abs_y;
+        int32_t dx = dx_abs / 4;
+        int32_t dy = dy_abs / 4;
+        if (dx > 127)  dx = 127;
+        if (dx < -127) dx = -127;
+        if (dy > 127)  dy = 127;
+        if (dy < -127) dy = -127;
+        s->prev_abs_x = s->abs_x;
+        s->prev_abs_y = s->abs_y;
+        amtp_emit_boot_mouse(s, (int8_t)dx, (int8_t)dy,
+                             s->button_left ? 0x01 : 0x00);
     }
 }
 
@@ -531,6 +552,8 @@ static void usb_apple_magic_trackpad_handle_reset(USBDevice *dev)
     s->finger_down        = false;
     s->button_left        = false;
     s->mt_seq             = 0;
+    s->prev_abs_x         = 0;
+    s->prev_abs_y         = 0;
     s->q_head = s->q_tail = 0;
 }
 
