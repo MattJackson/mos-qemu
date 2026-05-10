@@ -11,12 +11,15 @@ name: Build + push QEMU images to GHCR
 on:
   push:
     branches: [main]
+    # Trigger filter — workflow only runs when relevant files change.
+    # Per-job `if:` conditions further filter which jobs actually run.
     paths:
-      # Only rebuild patched image when files that actually feed it change.
-      - 'hw/**'
-      - 'pc-bios/**'
-      - 'Dockerfile.patched'
-      - '.github/workflows/build-image.yml'
+      - 'hw/**'                              # patched: source overlay
+      - 'pc-bios/**'                         # patched: ROM overlay
+      - 'Dockerfile.patched'                 # patched: build recipe
+      - 'Dockerfile.oem'                     # oem: build recipe (rare)
+      - '.github/workflows/build-image.yml'  # both: env QEMU_VERSION,
+                                             #       trigger logic, etc.
   workflow_dispatch:
     inputs:
       libapplegfx_sha:
@@ -111,10 +114,20 @@ jobs:
   build-oem:
     name: build mos-qemu-oem
     runs-on: ubuntu-latest
+    # OEM = vanilla upstream QEMU. Only signals a rebuild needs to happen:
+    #   1. Manual dispatch with build_oem=true (operator decides).
+    #   2. Dockerfile.oem itself was added or modified.
+    #   3. The workflow file was edited (most likely a QEMU_VERSION bump
+    #      since that's the env var here that affects OEM). False positives
+    #      here are cheap — OEM build is ~3 min in CI, runs rarely.
+    # All other workflow runs (hw/**, pc-bios/**, Dockerfile.patched edits)
+    # skip OEM because nothing about it changed.
     if: |
       (github.event_name == 'workflow_dispatch' && github.event.inputs.build_oem == 'true') ||
       contains(github.event.head_commit.added, 'Dockerfile.oem') ||
-      contains(github.event.head_commit.modified, 'Dockerfile.oem')
+      contains(github.event.head_commit.modified, 'Dockerfile.oem') ||
+      contains(github.event.head_commit.added, '.github/workflows/build-image.yml') ||
+      contains(github.event.head_commit.modified, '.github/workflows/build-image.yml')
     steps:
       - uses: actions/checkout@v4
 
