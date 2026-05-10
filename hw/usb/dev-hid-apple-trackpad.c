@@ -115,27 +115,29 @@ static const uint8_t amtp_iface0_report_desc[] = {
  * USB descriptor structures
  * ------------------------------------------------------------------------ */
 
-#define AMTP_VID                0x05ac
 /*
- * v3.0 PID escape: 0x0265 is "Magic Trackpad 2" — macOS' kext
- * `AppleMultitouchTrackpadHIDEventDriver` has a PID-specific match on
- * this value, and once bound its `handleInterruptReport` silently
- * drops every report (parser-type=1000 expects an Apple-private
- * OSDictionary built by `MultitouchHID.plugin` from the descriptor —
- * see memory/research_apple_multitouch_parser_re.md). Using a
- * different Apple PID (0x0266 — one off Magic Trackpad 2, not in any
- * known multitouch match list) makes macOS fall through to generic
- * `AppleHIDMouseEventDriver`, which consumes our boot-mouse Report
- * 0x02 directly. Tradeoff: device is no longer "Magic Trackpad 2" in
- * `system_profiler`, but the cursor actually moves.
+ * v3.0c VID escape: 0x05ac (Apple) alone routes us into macOS'
+ * `AppleUserUSBHostHIDDevice` DriverKit catch-all for Apple-VID HID
+ * devices without a specific kext personality. That dext was crashing
+ * before v1.7 (server exit before start), and even when it stays
+ * alive on a simpler descriptor it doesn't deliver pointer events to
+ * IOHIDSystem. Combined with the multitouch driver's parser block
+ * (RE in memory/research_apple_multitouch_parser_re.md) every Apple-
+ * VID path drops our reports.
  *
- * QEMU device name stays `apple-magic-trackpad` because the device
- * implementation still emulates the Magic Trackpad 2 USB shape
- * (4-iface composite, boot-mouse iface 1, vendor TopCase iface 0).
- * Only the USB-host-visible PID is changed.
+ * Using VID 0x046d (Logitech) escapes the Apple driver chain
+ * entirely. macOS' generic boot-mouse stack (AppleHIDMouseEventDriver
+ * kext) binds to any USB HID device with bSubClass=1 bProto=2
+ * regardless of VID/PID. Decades-old, reliable, processes 8-byte
+ * Report 0x02 directly.
+ *
+ * Tradeoff: system_profiler shows "Logitech Inc." instead of
+ * "Apple Inc.". Cursor moves. QEMU device name stays
+ * apple-magic-trackpad — only USB-host-visible VID is changed.
  */
-#define AMTP_PID                0x0266
-#define AMTP_BCD_DEVICE         0x0871
+#define AMTP_VID                0x046d
+#define AMTP_PID                0xc52b
+#define AMTP_BCD_DEVICE         0x0100
 
 #define AMTP_EP_IFACE0_IN       1   /* 0x81 — vendor heartbeats */
 #define AMTP_EP_IFACE1_IN       3   /* 0x83 — multitouch / boot mouse */
