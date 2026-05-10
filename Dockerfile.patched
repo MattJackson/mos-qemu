@@ -60,18 +60,44 @@ RUN --mount=type=cache,target=/root/.ccache \
 # Upstream QEMU tarball.
 ADD https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz /tmp/qemu-upstream.tar.xz
 
-# This whole repo is the mos-qemu fork; its hw/* + pc-bios/* overlay
-# the upstream tree. Copy the repo in via build context, not ADD URL —
-# means the image rebuilds when this repo's source changes (which is
-# what we want; the workflow tags by GITHUB_SHA).
+# ---------------------------------------------------------------------------
+# LAYER A — pre-build VANILLA QEMU. This layer is cached forever; only
+# invalidates on QEMU_VERSION bump or apk-deps change. ~3-4 min cold, 0s
+# warm (Docker layer cache).
+# ---------------------------------------------------------------------------
+RUN --mount=type=cache,target=/root/.ccache \
+    mkdir -p /tmp/qemu-build \
+    && tar xJ -C /tmp -f /tmp/qemu-upstream.tar.xz \
+    && cd /tmp/qemu-build \
+    && /tmp/qemu-${QEMU_VERSION}/configure \
+        --target-list=x86_64-softmmu \
+        --prefix=/usr \
+        --enable-kvm --enable-slirp --enable-linux-aio \
+        --enable-cap-ng --enable-seccomp --enable-vnc \
+        --disable-docs --disable-debug-info --disable-werror \
+    && make -j$(nproc) \
+    ; ccache -s || true
+
+# ---------------------------------------------------------------------------
+# LAYER B — overlay patched files. This layer invalidates ONLY when our
+# hw/** or pc-bios/** changes — the meaningful trigger for a rebuild.
+# ---------------------------------------------------------------------------
 COPY hw/         /tmp/mos-qemu/hw/
 COPY pc-bios/    /tmp/mos-qemu/pc-bios/
 
+# ---------------------------------------------------------------------------
+# LAYER C — incremental rebuild. Layer A left /tmp/qemu-build fully
+# populated with .o files. Copy patched .c files OVER the upstream
+# sources, then re-run make. Ninja detects only the changed files,
+# recompiles those (~5-10 .c files), and relinks qemu-system-x86_64.
+# Total: ~30-60s vs ~3-4 min full rebuild.
+#
+# touch -d ... ensures mtime is strictly newer than the .o files Layer A
+# produced (in case the COPY happens within the same second, ninja would
+# miss the rebuild trigger).
+# ---------------------------------------------------------------------------
 RUN --mount=type=cache,target=/root/.ccache \
-    rm -rf /tmp/qemu-${QEMU_VERSION} /tmp/qemu-build \
-    && mkdir -p /tmp/qemu-build \
-    && tar xJ -C /tmp -f /tmp/qemu-upstream.tar.xz \
-    && cd /tmp/qemu-${QEMU_VERSION} \
+    cd /tmp/qemu-${QEMU_VERSION} \
     && cp /tmp/mos-qemu/hw/misc/applesmc.c                  hw/misc/applesmc.c \
     && cp /tmp/mos-qemu/hw/display/vmware_vga.c             hw/display/vmware_vga.c \
     && cp /tmp/mos-qemu/hw/usb/dev-hid.c                    hw/usb/dev-hid.c \
@@ -85,13 +111,11 @@ RUN --mount=type=cache,target=/root/.ccache \
     && cp /tmp/mos-qemu/hw/display/Kconfig                  hw/display/Kconfig \
     && cp /tmp/mos-qemu/pc-bios/meson.build                 pc-bios/meson.build \
     && cp /tmp/mos-qemu/pc-bios/apple-gfx-pci.rom           pc-bios/apple-gfx-pci.rom \
+    && find hw/misc/applesmc.c hw/display/vmware_vga.c hw/usb/dev-hid.c \
+            hw/usb/dev-hid-apple-trackpad.c hw/display/apple-gfx-pci-linux.c \
+            hw/display/apple-gfx-common-linux.c hw/display/apple-gfx-linux.h \
+            -exec touch -d "$(date -R)" {} + \
     && cd /tmp/qemu-build \
-    && /tmp/qemu-${QEMU_VERSION}/configure \
-        --target-list=x86_64-softmmu \
-        --prefix=/usr \
-        --enable-kvm --enable-slirp --enable-linux-aio \
-        --enable-cap-ng --enable-seccomp --enable-vnc \
-        --disable-docs --disable-debug-info --disable-werror \
     && make -j$(nproc) \
     && make DESTDIR=/tmp/qemu-install install \
     ; ccache -s || true
