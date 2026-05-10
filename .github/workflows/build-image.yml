@@ -153,3 +153,4 @@ jobs:
           cache-from: type=gha,scope=oem
           cache-to: type=gha,scope=oem,mode=max
 # Build trigger
+# Rebuild with format fix
