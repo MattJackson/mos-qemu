@@ -490,7 +490,6 @@ static void amtp_input_event(DeviceState *dev, QemuConsole *src,
             s->button_left = btn->down;
         }
         s->pending_event = true;
-        fprintf(stderr, "AMTP: btn evt button=%d down=%d\n", btn->button, btn->down);
         break;
     }
     case INPUT_EVENT_KIND_ABS: {
@@ -502,8 +501,6 @@ static void amtp_input_event(DeviceState *dev, QemuConsole *src,
         }
         s->finger_down = true;
         s->pending_event = true;
-        fprintf(stderr, "AMTP: abs evt axis=%d val=%d (now %d,%d)\n",
-                m->axis, m->value, s->abs_x, s->abs_y);
         break;
     }
     default:
@@ -542,8 +539,6 @@ static void amtp_input_sync(DeviceState *dev)
         if (dy < -127) dy = -127;
         s->prev_abs_x = s->abs_x;
         s->prev_abs_y = s->abs_y;
-        fprintf(stderr, "AMTP: sync boot-mouse dx=%d dy=%d btn=%d\n",
-                (int)dx, (int)dy, s->button_left);
         amtp_emit_boot_mouse(s, (int8_t)dx, (int8_t)dy,
                              s->button_left ? 0x01 : 0x00);
     }
@@ -563,14 +558,7 @@ static QemuInputHandler amtp_input_handler = {
 static void usb_apple_magic_trackpad_handle_reset(USBDevice *dev)
 {
     USBAppleMagicTrackpadState *s = USB_APPLE_MAGIC_TRACKPAD(dev);
-    /* TEMP v2.2 experiment: macOS' AppleMultitouchTrackpadHIDEventDriver
-     * binds but doesn't issue the multitouch-enable SET_REPORT, AND it
-     * ignores boot-mouse Report 0x02 (HIDIdleTime stays high despite
-     * 851 successfully-delivered 8-byte reports). Force multitouch mode
-     * from boot so we always emit the variable-length multitouch shape
-     * the driver actually processes. If cursor moves: we drop the
-     * SET_REPORT-gated path. If not: revisit. */
-    s->multitouch_enabled = true;
+    s->multitouch_enabled = false;
     s->pending_event      = false;
     s->finger_down        = false;
     s->button_left        = false;
@@ -748,27 +736,10 @@ static void usb_apple_magic_trackpad_handle_control(USBDevice *dev, USBPacket *p
 static void usb_apple_magic_trackpad_handle_data(USBDevice *dev, USBPacket *p)
 {
     USBAppleMagicTrackpadState *s = USB_APPLE_MAGIC_TRACKPAD(dev);
-    static unsigned long total_calls;
-    static unsigned long poll_count[8] = {0};
-
-    /* Unconditional first-20 trace (regardless of pid/ep) so we can confirm
-     * whether handle_data is being called at all. */
-    total_calls++;
-    if (total_calls <= 20) {
-        fprintf(stderr, "AMTP: handle_data #%lu pid=%d ep=%d\n",
-                total_calls, p->pid, p->ep ? p->ep->nr : -1);
-    }
 
     if (p->pid != USB_TOKEN_IN) {
         p->status = USB_RET_STALL;
         return;
-    }
-
-    int ep = p->ep->nr;
-    if (ep < 8) poll_count[ep]++;
-    if (ep < 8 && (poll_count[ep] % 128) == 1) {
-        fprintf(stderr, "AMTP: poll EP%d IN #%lu qcount=%u\n",
-                ep, poll_count[ep], amtp_q_count(s));
     }
 
     /* Only Interface 1 EP3 IN carries cursor/multitouch data in v1. Other
@@ -785,9 +756,6 @@ static void usb_apple_magic_trackpad_handle_data(USBDevice *dev, USBPacket *p)
 
     USBAppleMagicTrackpadReport *r = &s->queue[s->q_tail];
     s->q_tail = (s->q_tail + 1) & (AMTP_QUEUE_DEPTH - 1);
-    fprintf(stderr, "AMTP: deliver EP3 IN len=%d data:", r->len);
-    for (int i = 0; i < r->len && i < 8; i++) fprintf(stderr, " %02x", r->data[i]);
-    fprintf(stderr, "\n");
     usb_packet_copy(p, r->data, r->len);
 }
 
