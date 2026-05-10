@@ -544,8 +544,13 @@ static void usb_apple_magic_trackpad_handle_control(USBDevice *dev, USBPacket *p
 
     ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
     if (ret >= 0) {
+        fprintf(stderr, "AMTP: STD req=0x%04x val=0x%04x idx=%d len=%d -> %d\n",
+                request, value, index, length, ret);
         return;
     }
+
+    fprintf(stderr, "AMTP: HID req=0x%04x val=0x%04x idx=%d len=%d\n",
+            request, value, index, length);
 
     switch (request) {
     /* HID class SET_REPORT — macOS issues feature/Report-0x02/{0x02, 0x01} on
@@ -555,6 +560,14 @@ static void usb_apple_magic_trackpad_handle_control(USBDevice *dev, USBPacket *p
     case HID_SET_REPORT: {
         uint8_t report_type = (value >> 8) & 0xff;
         uint8_t report_id   = value & 0xff;
+
+        fprintf(stderr, "AMTP:   SET_REPORT idx=%d type=%d id=0x%02x len=%d data:",
+                index, report_type, report_id, length);
+        for (int i = 0; i < length && i < 16; i++) {
+            fprintf(stderr, " %02x", data[i]);
+        }
+        if (length > 16) fprintf(stderr, " ...");
+        fprintf(stderr, "\n");
 
         if (report_type == 0x03 && report_id == 0x02 &&
             index == 1 && length >= 1 && data[0] == 0x02) {
@@ -655,6 +668,8 @@ static void usb_apple_magic_trackpad_handle_control(USBDevice *dev, USBPacket *p
         }
 
         if (reply_len == 0) {
+            fprintf(stderr, "AMTP:   GET_REPORT idx=%d id=0x%02x -> STALL\n",
+                    index, report_id);
             p->status = USB_RET_STALL;
             break;
         }
@@ -663,10 +678,13 @@ static void usb_apple_magic_trackpad_handle_control(USBDevice *dev, USBPacket *p
         }
         memset(data, 0, reply_len);
         p->actual_length = reply_len;
+        fprintf(stderr, "AMTP:   GET_REPORT idx=%d id=0x%02x -> %dB zeros\n",
+                index, report_id, reply_len);
         break;
     }
 
     default:
+        fprintf(stderr, "AMTP:   request=0x%04x -> STALL (unknown)\n", request);
         p->status = USB_RET_STALL;
         break;
     }
