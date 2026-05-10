@@ -563,7 +563,14 @@ static QemuInputHandler amtp_input_handler = {
 static void usb_apple_magic_trackpad_handle_reset(USBDevice *dev)
 {
     USBAppleMagicTrackpadState *s = USB_APPLE_MAGIC_TRACKPAD(dev);
-    s->multitouch_enabled = false;
+    /* TEMP v2.2 experiment: macOS' AppleMultitouchTrackpadHIDEventDriver
+     * binds but doesn't issue the multitouch-enable SET_REPORT, AND it
+     * ignores boot-mouse Report 0x02 (HIDIdleTime stays high despite
+     * 851 successfully-delivered 8-byte reports). Force multitouch mode
+     * from boot so we always emit the variable-length multitouch shape
+     * the driver actually processes. If cursor moves: we drop the
+     * SET_REPORT-gated path. If not: revisit. */
+    s->multitouch_enabled = true;
     s->pending_event      = false;
     s->finger_down        = false;
     s->button_left        = false;
