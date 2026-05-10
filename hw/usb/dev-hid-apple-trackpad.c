@@ -728,17 +728,25 @@ static void usb_apple_magic_trackpad_handle_control(USBDevice *dev, USBPacket *p
 static void usb_apple_magic_trackpad_handle_data(USBDevice *dev, USBPacket *p)
 {
     USBAppleMagicTrackpadState *s = USB_APPLE_MAGIC_TRACKPAD(dev);
+    static unsigned long total_calls;
     static unsigned long poll_count[8] = {0};
+
+    /* Unconditional first-20 trace (regardless of pid/ep) so we can confirm
+     * whether handle_data is being called at all. */
+    total_calls++;
+    if (total_calls <= 20) {
+        fprintf(stderr, "AMTP: handle_data #%lu pid=%d ep=%d\n",
+                total_calls, p->pid, p->ep ? p->ep->nr : -1);
+    }
 
     if (p->pid != USB_TOKEN_IN) {
         p->status = USB_RET_STALL;
         return;
     }
 
-    /* Trace every IN poll on every endpoint (rate-limited via counter). */
     int ep = p->ep->nr;
     if (ep < 8) poll_count[ep]++;
-    if (ep < 8 && (poll_count[ep] & 0x7f) == 0) {
+    if (ep < 8 && (poll_count[ep] % 128) == 1) {
         fprintf(stderr, "AMTP: poll EP%d IN #%lu qcount=%u\n",
                 ep, poll_count[ep], amtp_q_count(s));
     }
