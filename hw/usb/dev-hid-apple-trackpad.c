@@ -386,55 +386,76 @@ static void amtp_emit_boot_mouse(USBAppleMagicTrackpadState *s,
 }
 
 /* Multitouch Report 0x02 — emitted AFTER multitouch enable.
- *   byte 0:    0x02 (Report ID)
- *   byte 1:    button state (0x01 = pressed)
- *   bytes 2..7: 6-byte sequence/timestamp counter (little-endian)
- *   bytes 8 onwards: N × 9-byte per-finger records (Linux hid-magicmouse layout)
- *   last 4 bytes: trailer (purpose unverified — zeros are accepted by macOS
- *                 in observed wire frames)
+ *
+ * Wire format (verified 2026-05-10 from Apple kext + Linux hid-magicmouse +
+ * captured pcap of real Magic Trackpad 2 USB):
+ *
+ *   byte 0:      0x02 (Report ID)
+ *   byte 1:      button state (boot-mouse buttons; bit 0 = left)
+ *   bytes 2..7:  6-byte timestamp/counter (little-endian)
+ *   bytes 8..(8+9N-1): N × 9-byte per-finger records
+ *   bytes (frame_end-4)..(frame_end-1): 4-byte trailer
+ *
+ * macOS' AppleMultitouchTrackpadHIDEventDriver::handleInterruptReport
+ * splits the report at byte 8: the first 8 bytes feed the relative-pointer
+ * (boot-mouse) sub-parser; bytes 8+ are memmoved to offset 0 then fed to
+ * the multitouch parser via mtdevice->vtable[0x2c8]. Length must be > 8.
+ *
+ * Per-finger record (9 bytes) — Magic Trackpad 2 USB (PID 0x0265) layout
+ * per Linux drivers/hid/hid-magicmouse.c (path: TRACKPAD2_USB_REPORT_ID,
+ * decode lines ~223-230):
+ *
+ *   tdata[0]:        x bits 0..7
+ *   tdata[1] LO 4:   x bits 8..11   (signed 12-bit x at tdata[1:0])
+ *   tdata[1] HI 4:   y bits 0..3    (signed 12-bit y at tdata[2:1])
+ *   tdata[2]:        y bits 4..11
+ *   tdata[3]:        touch_major
+ *   tdata[4]:        touch_minor
+ *   tdata[5] LO 6:   size
+ *   tdata[5] HI 2:   id bits 0..1
+ *   tdata[6] LO 2:   id bits 2..3   (4-bit id total)
+ *   tdata[6] HI 6:   orientation + 32   (signed 6-bit, range -32..31)
+ *   tdata[7] HI 4:   state mask  (TOUCH_STATE_MASK 0xF0)
+ *                    0x00 = NONE, 0x30 = START, 0x40 = DRAG
+ *   tdata[7] LO 4:   reserved / 0
+ *   tdata[8]:        reserved / 0
+ *
+ * IMPORTANT: device emits y INVERTED (Linux negates on decode). We must
+ * invert before packing.
  *
  * For v1 we emit either 0-finger (12-byte idle frame) or 1-finger (21-byte
  * active frame). 2+ finger paths require multi-pointer input which QEMU's
  * input subsystem doesn't expose via VNC.
- *
- * Per-finger record (9 bytes per Linux hid-magicmouse.c):
- *   byte 0..2: x — signed 13-bit packed: ((b1<<27 | b0<<19) >> 19)
- *   byte 2..4: y — signed 13-bit packed similarly
- *   byte 4: touch_major (low nibble) | touch_minor (high nibble of byte 5)
- *   byte 5: size (high nibble) | touch_minor (low nibble)
- *   byte 6: orientation (signed 4-bit, range -31..32 stretched)
- *   byte 7: pressure (0..253)
- *   byte 8: id (low 4 bits) | state (high 4 bits)
- *
- * v1 fixed values (good enough for cursor + click; gestures need a multi-
- * pointer source):
- *   touch_major = 0x07 (smallish ellipse)
- *   touch_minor = 0x05
- *   size        = 0x40 (mid)
- *   orientation = 0   (no axis tilt)
- *   pressure    = button_left ? 0xC0 : 0x40
- *   id          = 0
- *   state       = 0x4 (active touch) when finger down, 0x0 (lifted) otherwise
  */
 static void amtp_pack_finger(uint8_t *out, int32_t x, int32_t y,
                              uint8_t pressure, uint8_t state, uint8_t id)
 {
-    /* x: signed 13-bit. Pack low 8 in byte 0, high 5 in low 5 of byte 1. */
-    uint16_t xu = (uint16_t)(x & 0x1fff);
-    uint16_t yu = (uint16_t)(y & 0x1fff);
+    /* 12-bit signed clamp. */
+    if (x < -2048) x = -2048;
+    else if (x > 2047) x = 2047;
+    if (y < -2048) y = -2048;
+    else if (y > 2047) y = 2047;
+
+    /* Device emits y inverted; Linux negates on decode. */
+    int32_t y_inv = -y;
+    uint16_t xu = (uint16_t)(x & 0x0fff);
+    uint16_t yu = (uint16_t)(y_inv & 0x0fff);
+
     out[0] = xu & 0xff;
-    out[1] = ((xu >> 8) & 0x1f) | ((yu & 0x07) << 5);
-    out[2] = (yu >> 3) & 0xff;
-    out[3] = 0x07;                  /* touch_major nibble + low minor */
-    out[4] = 0x40 | 0x05;            /* size | touch_minor */
-    out[5] = 0;                     /* orientation */
-    out[6] = pressure;
-    out[7] = (id & 0x0f) | ((state & 0x0f) << 4);
-    out[8] = 0;                     /* trailing per-finger byte (observed pattern; verify when multi-finger gestures come online) */
+    out[1] = ((xu >> 8) & 0x0f) | (uint8_t)((yu & 0x0f) << 4);
+    out[2] = (yu >> 4) & 0xff;
+    out[3] = 0x07;                                  /* touch_major */
+    out[4] = 0x05;                                  /* touch_minor */
+    out[5] = (0x30 & 0x3f) | (uint8_t)((id & 0x03) << 6);
+    out[6] = ((id >> 2) & 0x03) | (uint8_t)((32 & 0x3f) << 2);  /* orient = 0 → +32 */
+    out[7] = state & 0xf0;                          /* TOUCH_STATE in HI nibble */
+    out[8] = 0;
+
+    (void)pressure;  /* Magic Trackpad 2 USB (PID 0x0265) has no pressure field
+                      * — that's the USB-C variant (Linux path 2). */
 }
 
-/* x range from VNC abs (0..32767) to trackpad x-coord (-3678..3825 per real
- * Magic Trackpad 2 sensor range observed in Linux driver). Symmetric for y. */
+/* Map VNC abs coordinate (0..32767) to trackpad 12-bit signed range. */
 static int32_t amtp_map_abs(int32_t v, int32_t out_min, int32_t out_max)
 {
     int64_t span = (int64_t)(out_max - out_min);
@@ -449,21 +470,24 @@ static void amtp_emit_multitouch(USBAppleMagicTrackpadState *s)
 
     memset(buf, 0, frame_len);
     buf[0] = 0x02;                                  /* Report ID */
-    buf[1] = s->button_left ? 0x01 : 0x00;          /* button state */
-    /* 6-byte counter at bytes 2..7 (little-endian) */
+    buf[1] = s->button_left ? 0x01 : 0x00;          /* boot-mouse buttons */
+    /* bytes 2..7: 6-byte timestamp/counter (LE). The first 8 bytes feed
+     * the boot-mouse sub-parser; bytes 2..7 are 4 bytes of dx/dy/reserved
+     * which we zero (no relative motion — motion comes from multitouch). */
     buf[2] = (s->mt_seq >>  0) & 0xff;
     buf[3] = (s->mt_seq >>  8) & 0xff;
     buf[4] = (s->mt_seq >> 16) & 0xff;
     buf[5] = (s->mt_seq >> 24) & 0xff;
     buf[6] = 0;
-    buf[7] = 0x01;                                  /* observed: low byte of trailing field is 0x01 */
+    buf[7] = 0x01;                                  /* observed in real-device pcap */
 
     if (n_fingers >= 1) {
-        int32_t mt_x = amtp_map_abs(s->abs_x, -3678,  3825);
-        int32_t mt_y = amtp_map_abs(s->abs_y, -2280,  2280);
+        /* Magic Trackpad 2 USB sends 12-bit signed coords. */
+        int32_t mt_x = amtp_map_abs(s->abs_x, -2048, 2047);
+        int32_t mt_y = amtp_map_abs(s->abs_y, -2048, 2047);
         amtp_pack_finger(&buf[8], mt_x, mt_y,
-                         s->button_left ? 0xC0 : 0x40,
-                         /* state: 4=touching */ 4,
+                         /* pressure unused on this PID */ 0,
+                         /* TOUCH_STATE_DRAG = 0x40 (active touch) */ 0x40,
                          /* id */ 0);
     }
     /* trailer (last 4 bytes) — observed all-zero in some frames, varies in
