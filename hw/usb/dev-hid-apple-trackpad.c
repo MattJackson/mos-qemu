@@ -30,10 +30,31 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/log.h"
 #include "hw/input/hid.h"
 #include "hw/usb/hid.h"
 #include "hw/core/qdev-properties.h"
 #include "qom/object.h"
+
+/* Diagnostic logging. Routes to QEMU's -D log file (test.sh sets
+ * /data/logs/qemu-debug.log). Enabled by setting AMTP_TRACE=1 in the
+ * process environment OR by hard-toggling AMTP_TRACE_DEFAULT below.
+ * Cheap when disabled (single branch). */
+#define AMTP_TRACE_DEFAULT 1
+static bool amtp_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached == -1) {
+        const char *e = getenv("AMTP_TRACE");
+        cached = (e ? (atoi(e) != 0) : AMTP_TRACE_DEFAULT);
+    }
+    return cached;
+}
+#define AMTP_LOG(fmt, ...) do {                                              \
+    if (amtp_trace_enabled()) {                                              \
+        qemu_log("[amtp] " fmt "\n", ##__VA_ARGS__);                         \
+    }                                                                        \
+} while (0)
 
 /* ---------------------------------------------------------------------------
  * String table
@@ -358,11 +379,16 @@ static void amtp_enqueue(USBAppleMagicTrackpadState *s,
 {
     if (amtp_q_full(s)) {
         s->q_tail = (s->q_tail + 1) & (AMTP_QUEUE_DEPTH - 1);
+        AMTP_LOG("enqueue: queue full, dropped oldest");
     }
     USBAppleMagicTrackpadReport *r = &s->queue[s->q_head];
     memcpy(r->data, data, len);
     r->len = len;
     s->q_head = (s->q_head + 1) & (AMTP_QUEUE_DEPTH - 1);
+
+    AMTP_LOG("enqueue: len=%u id=0x%02x qsize=%u wakeup=%s",
+             len, data[0], amtp_q_count(s),
+             s->intr_ep3 ? "yes" : "NO-ep-null");
 
     /* Notify QEMU's USB stack that EP3 IN now has data. Without this, the
      * host stays parked after its first NAK and never re-polls. */
@@ -524,6 +550,7 @@ static void amtp_input_event(DeviceState *dev, QemuConsole *src,
         if (btn->button == INPUT_BUTTON_LEFT) {
             s->button_left = btn->down;
         }
+        AMTP_LOG("input_event BTN: button=%d down=%d", btn->button, btn->down);
         s->pending_event = true;
         break;
     }
@@ -534,11 +561,14 @@ static void amtp_input_event(DeviceState *dev, QemuConsole *src,
         } else if (m->axis == INPUT_AXIS_Y) {
             s->abs_y = m->value;
         }
+        AMTP_LOG("input_event ABS: axis=%d value=%" PRId64,
+                 (int)m->axis, (int64_t)m->value);
         s->finger_down = true;
         s->pending_event = true;
         break;
     }
     default:
+        AMTP_LOG("input_event UNKNOWN: type=%d", (int)evt->type);
         break;
     }
 }
@@ -551,6 +581,10 @@ static void amtp_input_sync(DeviceState *dev)
         return;
     }
     s->pending_event = false;
+
+    AMTP_LOG("input_sync: mt_enabled=%d finger_down=%d abs=(%d,%d) btn_l=%d",
+             s->multitouch_enabled, s->finger_down,
+             s->abs_x, s->abs_y, s->button_left);
 
     if (s->multitouch_enabled) {
         amtp_emit_multitouch(s);
@@ -651,11 +685,20 @@ static void usb_apple_magic_trackpad_handle_control(USBDevice *dev, USBPacket *p
     case HID_SET_REPORT: {
         uint8_t report_type = (value >> 8) & 0xff;
         uint8_t report_id   = value & 0xff;
+        bool flipped = false;
 
         if (report_type == 0x03 && report_id == 0x02 &&
             index == 1 && length >= 1 && data[0] == 0x02) {
+            if (!s->multitouch_enabled) {
+                flipped = true;
+            }
             s->multitouch_enabled = true;
         }
+        AMTP_LOG("SET_REPORT: type=0x%02x id=0x%02x iface=%d len=%d data[0]=0x%02x mt_enabled=%d%s",
+                 report_type, report_id, index, length,
+                 length > 0 ? data[0] : 0xff,
+                 s->multitouch_enabled,
+                 flipped ? " (FLIPPED ON)" : "");
         /* ACK with success — even unknown SET_REPORTs (other report IDs,
          * other interfaces) get silently absorbed so a probe loop never
          * stalls waiting for a STALL. */
