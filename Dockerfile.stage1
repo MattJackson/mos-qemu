@@ -53,18 +53,89 @@ RUN mkdir -p /usr/lib/pkgconfig \
     > /usr/lib/pkgconfig/vulkan.pc \
     && ln -sf libvulkan.so.1 /usr/lib/libvulkan.so
 
+# ---------------------------------------------------------------------------
+# STUB libapplegfx-vulkan — minimal pkg-config + empty .so + (no headers
+# needed). The patched hw/display/meson.build does
+# `dependency('libapplegfx-vulkan', required: true)`, so configure needs
+# pkg-config to RESPOND to the lagfx query. Our apple-gfx-pci-linux.c in
+# stage1 is an EMPTY tombstone (no #includes), so we don't ship lagfx
+# headers — gcc never tries to resolve them.
+#
+# Dockerfile.patched installs the REAL libapplegfx-vulkan on top of this
+# stub at Layer C time, providing real headers + real .so. Ninja sees
+# apple-gfx-pci-linux.c content change (empty → real) and recompiles
+# JUST that translation unit (real content now #includes real headers),
+# then relinks against the real .so. Total: ~30-60s.
+#
+# WHY THIS DESIGN: lagfx is in active M5-lane development (multiple
+# pushes/hour). If lagfx were baked into stage1, every lagfx push would
+# trigger an 11-min stage1 rebuild — defeating the fast-build promise.
+# By keeping lagfx in Dockerfile.patched + stubbing in stage1, lagfx
+# churn only invalidates Layer C (~30-60s) not stage1.
+# ---------------------------------------------------------------------------
+RUN mkdir -p /usr/lib /usr/lib/pkgconfig /tmp/stub-lagfx \
+    && : > /tmp/stub-lagfx/empty.c \
+    && cc -shared -fPIC -o /usr/lib/libapplegfx_vulkan.so /tmp/stub-lagfx/empty.c \
+    && printf 'prefix=/usr\nName: libapplegfx-vulkan\nDescription: STUB (Dockerfile.patched replaces at Layer C)\nVersion: 0.0.0-stage1-stub\nLibs: -L/usr/lib -lapplegfx_vulkan\nCflags: -I/usr/include\n' \
+       > /usr/lib/pkgconfig/libapplegfx-vulkan.pc \
+    && rm -rf /tmp/stub-lagfx
+
 # Upstream QEMU tarball — pinned by QEMU_VERSION ARG.
 ADD https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz /tmp/qemu-upstream.tar.xz
 
+# Extract upstream sources.
+RUN tar xJ -C /tmp -f /tmp/qemu-upstream.tar.xz
+
 # ---------------------------------------------------------------------------
-# Build vanilla QEMU. Leaves BOTH /tmp/qemu-${QEMU_VERSION}/ (source tree)
-# and /tmp/qemu-build/ (populated ninja build dir) in place. Dockerfile.patched
-# inherits both — Layer C's `cp ... && make` overwrites a handful of .c files
-# and runs an incremental relink (~30-60s) instead of a full ~3-4 min compile.
+# Overlay PATCHED build-system files (meson.build / Kconfig / trace-events
+# / pc-bios/meson.build) BEFORE configure + make. These declare apple-gfx-*
+# and apple-magic-trackpad as compilable sources. The actual .c source
+# bodies don't exist yet — we tombstone them as empty files so meson sees
+# them and configure succeeds. The empty files compile to empty .o objects;
+# Dockerfile.patched's Layer C overwrites the bodies with real content and
+# ninja sees only those .o files as stale, doing a true incremental rebuild
+# (~30-60s).
+#
+# WHY THIS LIVES IN STAGE1 (not Dockerfile.patched):
+# Previously Layer C did `cp` of these build-system files. Even when their
+# content was identical to upstream's, the cp updated their mtime to
+# greater than build.ninja's, which triggered meson's regenerate rule,
+# which re-ran `meson setup`, which made ninja re-decide ~all 2053 objects
+# need rebuilding (ccache mitigates per-object but orchestration takes
+# ~5 min). Moving these files into stage1 means Layer C only ever cps the
+# real .c files — meson.build / Kconfig / trace-events are already in place
+# and their mtimes never change, so meson never regenerates.
+# ---------------------------------------------------------------------------
+COPY hw/usb/meson.build         /tmp/qemu-${QEMU_VERSION}/hw/usb/meson.build
+COPY hw/display/meson.build     /tmp/qemu-${QEMU_VERSION}/hw/display/meson.build
+COPY hw/display/Kconfig         /tmp/qemu-${QEMU_VERSION}/hw/display/Kconfig
+COPY hw/display/trace-events    /tmp/qemu-${QEMU_VERSION}/hw/display/trace-events
+COPY pc-bios/meson.build        /tmp/qemu-${QEMU_VERSION}/pc-bios/meson.build
+
+# Empty-body tombstones for the patched sources. meson.build now references
+# these paths; they MUST exist (even at zero bytes) for `meson setup` to
+# succeed. Layer C in Dockerfile.patched overwrites them with real content.
+# The .h tombstone needs to be a valid header — empty is fine since
+# everything that includes it is also tombstoned.
+RUN mkdir -p /tmp/qemu-${QEMU_VERSION}/hw/display \
+             /tmp/qemu-${QEMU_VERSION}/hw/usb \
+             /tmp/qemu-${QEMU_VERSION}/pc-bios \
+    && touch /tmp/qemu-${QEMU_VERSION}/hw/display/apple-gfx-pci-linux.c \
+             /tmp/qemu-${QEMU_VERSION}/hw/display/apple-gfx-common-linux.c \
+             /tmp/qemu-${QEMU_VERSION}/hw/display/apple-gfx-linux.h \
+             /tmp/qemu-${QEMU_VERSION}/hw/usb/dev-hid-apple-trackpad.c \
+             /tmp/qemu-${QEMU_VERSION}/pc-bios/apple-gfx-pci.rom
+
+# ---------------------------------------------------------------------------
+# Configure + build the PATCHED-layout QEMU with EMPTY apple-* sources.
+# The binary works for everything not using apple-gfx-pci / apple-magic-*
+# but has no implementations of those devices. Dockerfile.patched's Layer C
+# overlays real .c content and relinks (~30-60s). The /tmp/qemu-build/
+# directory at the end of this stage has ~2053 .o files already built;
+# Layer C only invalidates the ones we replace.
 # ---------------------------------------------------------------------------
 RUN --mount=type=cache,target=/root/.ccache \
     mkdir -p /tmp/qemu-build \
-    && tar xJ -C /tmp -f /tmp/qemu-upstream.tar.xz \
     && cd /tmp/qemu-build \
     && /tmp/qemu-${QEMU_VERSION}/configure \
         --target-list=x86_64-softmmu \

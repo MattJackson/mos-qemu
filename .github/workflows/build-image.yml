@@ -87,6 +87,9 @@ jobs:
         run: |
           # Default to workflow input on dispatch, else 'main'. Resolve
           # to a real SHA so the image tag is content-addressable.
+          # lagfx is installed at Layer C in Dockerfile.patched (NOT in
+          # stage1) so lagfx pushes only invalidate Layer C (~30-60s),
+          # not stage1 (~11min). M5 agent iterates lagfx fast.
           input_sha="${{ github.event.inputs.libapplegfx_sha }}"
           ref="${input_sha:-main}"
           full_sha=$(git ls-remote https://github.com/MattJackson/libapplegfx-vulkan.git "$ref" \

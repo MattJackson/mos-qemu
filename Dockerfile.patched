@@ -49,10 +49,14 @@ RUN test -f /tmp/qemu-build/.stage1-marker \
         && exit 1)
 
 # ---------------------------------------------------------------------------
-# Build libapplegfx-vulkan AFTER stage1's vanilla QEMU. URL-pinned by SHA:
-# when LIBAPPLEGFX_SHA changes the layer invalidates without --no-cache.
-# lagfx install lands in /usr so Layer C's patched apple-gfx-pci-linux.c
-# links against it. ~10-15s.
+# Install REAL libapplegfx-vulkan — overwrites stage1's stub .so + adds
+# real headers under /usr/include. Pinned by URL-SHA (LIBAPPLEGFX_SHA
+# build-arg). Layer invalidates only when SHA changes, but lagfx is in
+# active M5-lane development (multiple pushes/hour) so this layer
+# rebuilds often. It's small (~10-15s on warm cache) which is acceptable.
+# Layer C below detects the .so change → rebuilds apple-gfx-pci-linux.c
+# (which now has real includes) and relinks qemu-system-x86_64. Total
+# end-to-end: ~30-60s for the patched build.
 # ---------------------------------------------------------------------------
 ADD https://github.com/MattJackson/libapplegfx-vulkan/archive/${LIBAPPLEGFX_SHA}.tar.gz /tmp/libapplegfx-vulkan.tar.gz
 RUN --mount=type=cache,target=/root/.ccache \
@@ -61,7 +65,7 @@ RUN --mount=type=cache,target=/root/.ccache \
     && cd /tmp/libapplegfx-vulkan \
     && meson setup --prefix=/usr --libdir=lib -Dtests=false /tmp/lagfx-build \
     && DESTDIR=/tmp/lagfx-install ninja -C /tmp/lagfx-build install \
-    && cp -r /tmp/lagfx-install/usr/* /usr/    # install into builder for QEMU rebuild
+    && cp -r /tmp/lagfx-install/usr/* /usr/
 
 # ---------------------------------------------------------------------------
 # LAYER B — overlay patched files. This layer invalidates ONLY when our
@@ -72,14 +76,18 @@ COPY pc-bios/    /tmp/mos-qemu/pc-bios/
 
 # ---------------------------------------------------------------------------
 # LAYER C — incremental rebuild. Stage1 left /tmp/qemu-build fully
-# populated with .o files. Copy patched .c files OVER the upstream
-# sources, then re-run make. Ninja detects only the changed files,
-# recompiles those (~5-10 .c files), and relinks qemu-system-x86_64.
-# Total: ~30-60s vs ~3-4 min full rebuild.
+# populated with .o files for the PATCHED layout (apple-gfx-* and
+# dev-hid-apple-trackpad.c declared in meson.build but their .c bodies
+# are empty tombstones). Copy ONLY .c/.h/.rom content over the
+# tombstones / upstream files, then `make`. Ninja detects content
+# changes and recompiles ONLY those translation units (~5-10 files)
+# and relinks qemu-system-x86_64. Total: ~30-60s.
 #
-# touch -d ... ensures mtime is strictly newer than the .o files stage1
-# produced (in case the COPY happens within the same second, ninja would
-# miss the rebuild trigger).
+# CRITICAL: we deliberately do NOT cp meson.build / Kconfig / trace-events
+# in this layer. Stage1 already has the patched versions; touching them
+# again would update mtime, trigger meson regenerate, and force a full
+# 2053-object rebuild (the bug fixed by 2026-05-10 stage1-bake-buildsys
+# refactor). If you need to edit those files, bump stage1 instead.
 # ---------------------------------------------------------------------------
 RUN --mount=type=cache,target=/root/.ccache \
     cd /tmp/qemu-${QEMU_VERSION} \
@@ -87,19 +95,10 @@ RUN --mount=type=cache,target=/root/.ccache \
     && cp /tmp/mos-qemu/hw/display/vmware_vga.c             hw/display/vmware_vga.c \
     && cp /tmp/mos-qemu/hw/usb/dev-hid.c                    hw/usb/dev-hid.c \
     && cp /tmp/mos-qemu/hw/usb/dev-hid-apple-trackpad.c     hw/usb/dev-hid-apple-trackpad.c \
-    && cp /tmp/mos-qemu/hw/usb/meson.build                  hw/usb/meson.build \
-    && cp /tmp/mos-qemu/hw/display/apple-gfx-pci-linux.c    hw/display/ \
-    && cp /tmp/mos-qemu/hw/display/apple-gfx-common-linux.c hw/display/ \
-    && cp /tmp/mos-qemu/hw/display/apple-gfx-linux.h        hw/display/ \
-    && cp /tmp/mos-qemu/hw/display/meson.build              hw/display/meson.build \
-    && cp /tmp/mos-qemu/hw/display/trace-events             hw/display/trace-events \
-    && cp /tmp/mos-qemu/hw/display/Kconfig                  hw/display/Kconfig \
-    && cp /tmp/mos-qemu/pc-bios/meson.build                 pc-bios/meson.build \
+    && cp /tmp/mos-qemu/hw/display/apple-gfx-pci-linux.c    hw/display/apple-gfx-pci-linux.c \
+    && cp /tmp/mos-qemu/hw/display/apple-gfx-common-linux.c hw/display/apple-gfx-common-linux.c \
+    && cp /tmp/mos-qemu/hw/display/apple-gfx-linux.h        hw/display/apple-gfx-linux.h \
     && cp /tmp/mos-qemu/pc-bios/apple-gfx-pci.rom           pc-bios/apple-gfx-pci.rom \
-    && find hw/misc/applesmc.c hw/display/vmware_vga.c hw/usb/dev-hid.c \
-            hw/usb/dev-hid-apple-trackpad.c hw/display/apple-gfx-pci-linux.c \
-            hw/display/apple-gfx-common-linux.c hw/display/apple-gfx-linux.h \
-            -exec touch {} + \
     && cd /tmp/qemu-build \
     && make -j$(nproc) \
     && make DESTDIR=/tmp/qemu-install install \
