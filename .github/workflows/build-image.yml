@@ -13,6 +13,11 @@ on:
     branches: [main]
     # Trigger filter — workflow only runs when relevant files change.
     # Per-job `if:` conditions further filter which jobs actually run.
+    #
+    # NOTE: Dockerfile.stage1 + build-stage1.yml are deliberately
+    # NOT included here. Those are handled by .github/workflows/build-stage1.yml
+    # which only fires on stage1 changes. The patched build below `FROM`s
+    # the prebuilt stage1 image from GHCR.
     paths:
       - 'hw/**'                              # patched: source overlay
       - 'pc-bios/**'                         # patched: ROM overlay
@@ -37,6 +42,16 @@ env:
   QEMU_VERSION: '11.0.0'
   REGISTRY: ghcr.io
   OWNER: mattjackson
+
+# Cancel any in-flight build on the same ref. Without this, when main
+# gets two pushes in quick succession (libapplegfx churns multiple
+# commits/hour during active dev), the two CI runs race and their GHA
+# buildx caches clobber each other — patched Layer C ends up rebuilding
+# vanilla QEMU from scratch on the second run. With cancel-in-progress
+# the older run dies cleanly and the new run gets a coherent cache.
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -79,6 +94,27 @@ jobs:
           fi
           echo "sha=$full_sha" >> "$GITHUB_OUTPUT"
           echo "Resolved libapplegfx-vulkan: $ref → $full_sha"
+
+      # If this run was kicked off by the same commit that introduces
+      # the stage1 split, the stage1 workflow is racing us and the
+      # stage1 image may not be in GHCR yet. Poll for it (max ~12 min)
+      # rather than failing immediately — saves the operator a manual
+      # re-run after the stage1 build completes.
+      - name: Wait for stage1 image
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/mos-qemu-stage1:${{ env.QEMU_VERSION }}"
+          echo "Checking $IMAGE is published in GHCR..."
+          for attempt in $(seq 1 72); do
+            if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+              echo "Stage1 image found on attempt $attempt."
+              exit 0
+            fi
+            echo "  attempt $attempt/72 — not yet, sleeping 10s..."
+            sleep 10
+          done
+          echo "::error::Stage1 image $IMAGE not found after ~12 min."
+          echo "::error::Trigger build-stage1.yml first, then re-run this workflow."
+          exit 1
 
       - name: Build + push patched image
         uses: docker/build-push-action@v5

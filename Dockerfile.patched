@@ -3,82 +3,56 @@
 # image. Pushed to ghcr.io/mattjackson/mos-qemu-patched:<sha> by
 # `.github/workflows/build-image.yml` on every push to main.
 #
-# Consumers (mos-docker) FROM this image and COPY /usr/* into their
-# runtime layer. Building QEMU is the slow step (~3-4 min) and only
-# needs to happen once per push to mos-qemu (or per libapplegfx bump),
-# not once per `./mos build`.
+# ARCHITECTURE (post 2026-05-10 split):
+#   stage1 (Dockerfile.stage1) builds VANILLA QEMU 11.0.0 once and keeps
+#   /tmp/qemu-build/ as a live filesystem. This image (Dockerfile.patched)
+#   inherits stage1 as its `builder` and runs ONLY:
+#     1. libapplegfx-vulkan install (~10-15s)
+#     2. Patched file overlay + incremental relink (~30-60s)
 #
-# Output is `FROM scratch` with the install layout rooted at /usr —
-# binaries at /usr/bin/, libs at /usr/lib/, BIOS blobs + keymaps at
-# /usr/share/qemu/. Nothing is intended to RUN from this image; it's
-# pure artifact. Consumer layers in their own runtime libs.
+#   That makes a patched build ~30-60s total (vs the ~16 min pre-split
+#   regression caused by concurrent lagfx-churn invalidating Layer A).
+#
+# Stage1 rebuilds only on QEMU_VERSION bump or Dockerfile.stage1 edit —
+# triggered by .github/workflows/build-stage1.yml, NOT this workflow.
+#
+# Consumers (mos-docker) FROM this image and COPY /usr/* into their
+# runtime layer. Output is `FROM scratch` with the install layout rooted
+# at /usr — binaries at /usr/bin/, libs at /usr/lib/, BIOS blobs + keymaps
+# at /usr/share/qemu/. Nothing is intended to RUN from this image; it's
+# pure artifact.
 
 ARG QEMU_VERSION=11.0.0
 ARG LIBAPPLEGFX_SHA=main
 
 # ---------------------------------------------------------------------------
-# Builder stage — alpine base + ccache, builds lagfx then patched QEMU.
-# Mirrors the structure mos-docker used before this split.
+# Builder stage — inherits the pre-built vanilla QEMU from stage1. The
+# stage1 image carries:
+#   /tmp/qemu-${QEMU_VERSION}/   — extracted upstream source
+#   /tmp/qemu-build/             — populated ninja build dir with .o files
+#   /usr/lib/pkgconfig/vulkan.pc — Alpine stub
+#   /usr/lib/libvulkan.so        — symlink
+#   apk-installed build deps     — build-base, ninja, meson, vulkan-loader, etc.
 # ---------------------------------------------------------------------------
-FROM alpine:3.21 AS builder
+FROM ghcr.io/mattjackson/mos-qemu-stage1:${QEMU_VERSION} AS builder
 ARG QEMU_VERSION
 ARG LIBAPPLEGFX_SHA
 
-RUN apk add --no-cache \
-    build-base python3 ninja meson pkgconf \
-    glib-dev pixman-dev libcap-ng-dev libseccomp-dev \
-    libslirp-dev libaio-dev curl bash dtc-dev \
-    mesa-vulkan-swrast vulkan-loader vulkan-headers vulkan-tools \
-    ccache
-
-ENV PATH="/usr/lib/ccache/bin:${PATH}" \
-    CCACHE_DIR=/root/.ccache \
-    CCACHE_MAXSIZE=2G \
-    CCACHE_BASEDIR=/tmp \
-    CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime,file_macro,locale,pch_defines \
-    CCACHE_COMPILERCHECK=content \
-    CCACHE_NOHASHDIR=1
-
-# Alpine ships libvulkan.so.1 but no vulkan.pc / libvulkan.so symlink.
-RUN mkdir -p /usr/lib/pkgconfig \
-    && printf 'Name: vulkan\nVersion: 1.3.296\nDescription: Vulkan loader\nLibs: -L/usr/lib -lvulkan\nCflags: -I/usr/include\n' \
-    > /usr/lib/pkgconfig/vulkan.pc \
-    && ln -sf libvulkan.so.1 /usr/lib/libvulkan.so
-
-# Upstream QEMU tarball.
-ADD https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz /tmp/qemu-upstream.tar.xz
+# Sanity check — confirm we're actually layered on a real stage1 image.
+# If someone accidentally points FROM at vanilla alpine, this will fail
+# loud instead of silently doing a 16-min full rebuild.
+RUN test -f /tmp/qemu-build/.stage1-marker \
+    && test -f /tmp/qemu-build/qemu-system-x86_64 \
+    && test -d /tmp/qemu-${QEMU_VERSION} \
+    || (echo "STAGE1 MISSING: this image is not built on top of mos-qemu-stage1:${QEMU_VERSION}." \
+        && echo "Either rebuild stage1 (gh workflow run build-stage1.yml) or pin a correct version." \
+        && exit 1)
 
 # ---------------------------------------------------------------------------
-# LAYER A — pre-build VANILLA QEMU. This layer is cached forever; only
-# invalidates on QEMU_VERSION bump or apk-deps change. ~3-4 min cold, 0s
-# warm (Docker layer cache).
-#
-# IMPORTANT: This must come BEFORE the libapplegfx-vulkan layer. lagfx's
-# main branch churns multiple times per hour during active development;
-# if its ADD-by-SHA layer sits above Layer A, every lagfx commit
-# cascades invalidation downward and Layer A rebuilds for free. Vanilla
-# QEMU configure has no dependency on libapplegfx — the patched
-# apple-gfx-pci-linux.c only enters the build in Layer C.
-# ---------------------------------------------------------------------------
-RUN --mount=type=cache,target=/root/.ccache \
-    mkdir -p /tmp/qemu-build \
-    && tar xJ -C /tmp -f /tmp/qemu-upstream.tar.xz \
-    && cd /tmp/qemu-build \
-    && /tmp/qemu-${QEMU_VERSION}/configure \
-        --target-list=x86_64-softmmu \
-        --prefix=/usr \
-        --enable-kvm --enable-slirp --enable-linux-aio \
-        --enable-cap-ng --enable-seccomp --enable-vnc \
-        --disable-docs --disable-debug-info --disable-werror \
-    && make -j$(nproc) \
-    ; ccache -s || true
-
-# ---------------------------------------------------------------------------
-# Build libapplegfx-vulkan AFTER Layer A so its frequent main-branch
-# churn doesn't invalidate the slow vanilla-QEMU compile. URL-pinned by
-# SHA: when LIBAPPLEGFX_SHA changes the layer invalidates without
-# --no-cache. lagfx install lands in /usr so Layer C's patched
-# apple-gfx-pci-linux.c links against it.
+# Build libapplegfx-vulkan AFTER stage1's vanilla QEMU. URL-pinned by SHA:
+# when LIBAPPLEGFX_SHA changes the layer invalidates without --no-cache.
+# lagfx install lands in /usr so Layer C's patched apple-gfx-pci-linux.c
+# links against it. ~10-15s.
 # ---------------------------------------------------------------------------
 ADD https://github.com/MattJackson/libapplegfx-vulkan/archive/${LIBAPPLEGFX_SHA}.tar.gz /tmp/libapplegfx-vulkan.tar.gz
 RUN --mount=type=cache,target=/root/.ccache \
@@ -97,13 +71,13 @@ COPY hw/         /tmp/mos-qemu/hw/
 COPY pc-bios/    /tmp/mos-qemu/pc-bios/
 
 # ---------------------------------------------------------------------------
-# LAYER C — incremental rebuild. Layer A left /tmp/qemu-build fully
+# LAYER C — incremental rebuild. Stage1 left /tmp/qemu-build fully
 # populated with .o files. Copy patched .c files OVER the upstream
 # sources, then re-run make. Ninja detects only the changed files,
 # recompiles those (~5-10 .c files), and relinks qemu-system-x86_64.
 # Total: ~30-60s vs ~3-4 min full rebuild.
 #
-# touch -d ... ensures mtime is strictly newer than the .o files Layer A
+# touch -d ... ensures mtime is strictly newer than the .o files stage1
 # produced (in case the COPY happens within the same second, ninja would
 # miss the rebuild trigger).
 # ---------------------------------------------------------------------------
