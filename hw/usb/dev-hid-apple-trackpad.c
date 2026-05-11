@@ -444,12 +444,23 @@ static void amtp_pack_finger(uint8_t *out, int32_t x, int32_t y,
     out[0] = xu & 0xff;
     out[1] = ((xu >> 8) & 0x0f) | (uint8_t)((yu & 0x0f) << 4);
     out[2] = (yu >> 4) & 0xff;
-    out[3] = 0x07;                                  /* touch_major */
-    out[4] = 0x05;                                  /* touch_minor */
-    out[5] = (0x30 & 0x3f) | (uint8_t)((id & 0x03) << 6);
-    out[6] = ((id >> 2) & 0x03) | (uint8_t)((32 & 0x3f) << 2);  /* orient = 0 → +32 */
-    out[7] = state & 0xf0;                          /* TOUCH_STATE in HI nibble */
-    out[8] = 0;
+    /* Bytes 3..8 — touch geometry + state. Values chosen to match a
+     * real-device pcap of an active 1-finger frame
+     * (`31 58 b7 2e 55 86 d1 8b 85`, decoded by Linux's formula as
+     * x=-1999, y=1163, touch_major=46, touch_minor=85, size=6,
+     * orient=20, id=6, state=0x80, b8=0x85). Verified 2026-05-10 by
+     * round-trip test. */
+    out[3] = 0x2e;                          /* touch_major (real-device value) */
+    out[4] = 0x55;                          /* touch_minor */
+    out[5] = (6 & 0x3f) | (uint8_t)((id & 0x03) << 6);
+    out[6] = ((id >> 2) & 0x03) | (uint8_t)(((20 + 32) & 0x3f) << 2);
+    /* state byte: Linux defines TOUCH_STATE_DRAG=0x40 but real Apple
+     * firmware emits 0x80 in HI nibble for active touch — Linux's
+     * constant turns out to be wrong/aspirational. Caller passes the
+     * HI-nibble value (0x80 = active, 0x00 = lifted). LO nibble 0x0b
+     * matches real-device pcap (unknown decode but cheap to mirror). */
+    out[7] = (state & 0xf0) | 0x0b;
+    out[8] = 0x85;                          /* matches real-device pcap */
 
     (void)pressure;  /* Magic Trackpad 2 USB (PID 0x0265) has no pressure field
                       * — that's the USB-C variant (Linux path 2). */
@@ -487,7 +498,7 @@ static void amtp_emit_multitouch(USBAppleMagicTrackpadState *s)
         int32_t mt_y = amtp_map_abs(s->abs_y, -2048, 2047);
         amtp_pack_finger(&buf[8], mt_x, mt_y,
                          /* pressure unused on this PID */ 0,
-                         /* TOUCH_STATE_DRAG = 0x40 (active touch) */ 0x40,
+                         /* active touch state — matches real device pcap */ 0x80,
                          /* id */ 0);
     }
     /* trailer (last 4 bytes) — observed all-zero in some frames, varies in
