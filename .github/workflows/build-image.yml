@@ -39,7 +39,7 @@ on:
         type: boolean
         default: false
       force_no_cache:
-        description: 'Force full uncached rebuild (bypasses GHA cache)'
+        description: 'Force full uncached rebuild (bypasses GHA cache) — use only when Docker layers are stale'
         type: boolean
         default: false
 
