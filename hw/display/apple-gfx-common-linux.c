@@ -486,7 +486,7 @@ apple_gfx_vblank_tick(void *opaque)
         s->initial_surface_pushed = true;
     }
 
-  lagfx_display_tick_vblank(s->lagfx_dev, s,
+  lagfx_timer_tick_vblank(s->lagfx_dev, s,
                                apple_gfx_write_memory, apple_gfx_read_memory);
     timer_mod(&s->vblank_timer,
               qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
