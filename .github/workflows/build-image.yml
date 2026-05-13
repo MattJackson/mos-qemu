@@ -38,6 +38,10 @@ on:
         description: 'Also rebuild the OEM image (only needed on QEMU version bumps)'
         type: boolean
         default: false
+      force_no_cache:
+        description: 'Force full uncached rebuild (bypasses GHA cache)'
+        type: boolean
+        default: false
 
 # Pin QEMU version exactly to ci.yml (which validates against this version).
 # Bump in lockstep when upgrading.
@@ -159,8 +163,8 @@ jobs:
           build-args: |
             QEMU_VERSION=${{ env.QEMU_VERSION }}
             LIBAPPLEGFX_SHA=${{ steps.lagfx.outputs.sha }}
-          cache-from: type=gha,scope=patched
-          cache-to: type=gha,scope=patched,mode=max
+          cache-from: ${{ github.event.inputs.force_no_cache == 'true' && 'none' || 'type=gha,scope=patched' }}
+          no-cache: ${{ github.event.inputs.force_no_cache == 'true' && 'true' || 'false' }}
 
       - name: Print resolved tags
         run: |
