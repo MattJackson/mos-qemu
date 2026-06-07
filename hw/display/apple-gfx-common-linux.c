@@ -621,9 +621,14 @@ static void
 apple_gfx_cursor_moved_bh(void *opaque)
 {
     AppleGFXLinuxState *s = opaque;
-    lagfx_coord_t pos = lagfx_display_cursor_position(s->lagfx_disp);
 
     BQL_LOCK_GUARD();
+    /* B4: read lagfx_disp UNDER the BQL — unrealize frees/NULLs it under the
+     * BQL, so reading it before taking the lock was a use-after-free. */
+    if (!s->lagfx_disp) {
+        return;
+    }
+    lagfx_coord_t pos = lagfx_display_cursor_position(s->lagfx_disp);
     dpy_mouse_set(s->con, pos.x, pos.y, s->cursor_show);
 }
 
@@ -744,6 +749,11 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
      * (3× uint32_t). Can't cast directly — different layout. */
     static lagfx_display_mode_t converted_modes[4];
     unsigned mode_count = s->display_modes ? s->num_display_modes : num_display_modes;
+    /* B5: converted_modes[] holds 4; mode_count is operator-controlled
+     * (-display-modes) — clamp or apple_gfx_modes_to_lagfx overflows the stack. */
+    if (mode_count > 4u) {
+        mode_count = 4u;
+    }
     const AppleGFXDisplayMode *src_modes = s->display_modes ? s->display_modes : display_modes;
     apple_gfx_modes_to_lagfx(converted_modes, src_modes, mode_count);
     disp_desc.modes = converted_modes;
