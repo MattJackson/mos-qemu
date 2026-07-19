@@ -1,0 +1,1431 @@
+From b9c2bd25b7c5fe97b0fdc2745d56f85fd5d036d5 Mon Sep 17 00:00:00 2001
+From: Matthew Jackson <matthew@pq.io>
+Date: Sun, 19 Jul 2026 09:08:07 -0700
+Subject: [PATCH 2/4] hw/display: add apple-gfx-pci device for Linux hosts
+
+Add a Linux-host implementation of the apple-gfx-pci paravirtualized
+graphics device. It exposes the same guest-visible PCI device as the
+macOS-host apple-gfx-pci.m (vendor 0x106b, device 0xeeee), so an
+unmodified macOS guest binds its stock AppleParavirtGPU.kext driver,
+but the host side is plain C backed by the external libapplegfx-vulkan
+library instead of Apple's ParavirtualizedGraphics.framework.
+
+The split mirrors the macOS implementation: apple-gfx-common-linux.c
+carries the transport-agnostic core (task and memory management via
+the library's shell callbacks, interrupt injection through legacy MSI,
+display frame/cursor callbacks bridged onto QEMU's console layer via
+bottom halves, MMIO forwarding), and apple-gfx-pci-linux.c is the thin
+PCI transport (BAR + MSI + QOM boilerplate and properties).
+
+Guest protocol handling, command decoding and rendering live entirely
+in libapplegfx-vulkan; rendering works on any Vulkan implementation
+including Mesa's software lavapipe driver, so no host GPU is required.
+
+Properties:
+ - display-modes: array of <width>x<height>@<refresh> mode strings
+ - gpu_cores: caps the library's worker thread pool (0 = auto)
+
+The device is only built when the libapplegfx-vulkan dependency was
+found (new 'libapplegfx' meson option); it compiles to nothing on
+other configurations, and no existing file's behaviour changes.
+
+Live migration is blocked for now via a migration blocker registered
+at realize; the device has no vmstate yet.
+
+Signed-off-by: Matthew Jackson <matthew@pq.io>
+---
+ MAINTAINERS                         |   6 +
+ hw/display/Kconfig                  |   5 +
+ hw/display/apple-gfx-common-linux.c | 913 ++++++++++++++++++++++++++++
+ hw/display/apple-gfx-linux.h        | 123 ++++
+ hw/display/apple-gfx-pci-linux.c    | 281 +++++++++
+ hw/display/meson.build              |   5 +
+ 6 files changed, 1333 insertions(+)
+ create mode 100644 hw/display/apple-gfx-common-linux.c
+ create mode 100644 hw/display/apple-gfx-linux.h
+ create mode 100644 hw/display/apple-gfx-pci-linux.c
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 296a9c769..c9432c951 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2843,6 +2843,12 @@ M: Phil Dennis-Jordan <phil@philjordan.eu>
+ S: Maintained
+ F: hw/display/apple-gfx*
+ 
++Apple PV Graphics for Linux hosts (apple-gfx-pci-linux)
++M: Matthew Jackson <matthew@pq.io>
++S: Maintained
++F: hw/display/apple-gfx-*linux*
++F: docs/system/devices/apple-gfx-linux.rst
++
+ PIIX4 South Bridge (i82371AB)
+ M: Hervé Poussineau <hpoussin@reactos.org>
+ M: Philippe Mathieu-Daudé <philmd@linaro.org>
+diff --git a/hw/display/Kconfig b/hw/display/Kconfig
+index 1e95ab28e..b23044c32 100644
+--- a/hw/display/Kconfig
++++ b/hw/display/Kconfig
+@@ -149,3 +149,8 @@ config MAC_PVG_PCI
+     bool
+     depends on MAC_PVG && PCI
+     default y if PCI_DEVICES
++
++config APPLE_GFX_PCI_LINUX
++    bool
++    depends on PCI
++    default y if PCI_DEVICES
+diff --git a/hw/display/apple-gfx-common-linux.c b/hw/display/apple-gfx-common-linux.c
+new file mode 100644
+index 000000000..6e7d5401c
+--- /dev/null
++++ b/hw/display/apple-gfx-common-linux.c
+@@ -0,0 +1,913 @@
++/*
++ * QEMU Apple ParavirtualizedGraphics.framework device, transport-agnostic
++ * core, for Linux hosts.
++ *
++ * Copyright (c) 2026 Matthew Jackson <matthew@pq.io>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * C port of the transport-agnostic core of the macOS-host apple-gfx.m
++ * device (Phil Dennis-Jordan), backed by the external libapplegfx-vulkan
++ * library instead of Apple's ParavirtualizedGraphics.framework.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/lockable.h"
++#include "qemu/cutils.h"
++#include "qemu/log.h"
++#include "qapi/visitor.h"
++#include "qapi/error.h"
++#include "qemu/error-report.h"
++#include "qemu/aio-wait.h"
++#include "system/address-spaces.h"
++#include "system/dma.h"
++#include "migration/blocker.h"
++#include "ui/console.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/pci/msi.h"
++#include "hw/pci/pci.h"
++#include "apple-gfx-linux.h"
++
++
++/*
++ * AppleGFXDisplayMode is 3x uint16_t (6 bytes); lagfx_display_mode_t is
++ * 3x uint32_t (12 bytes). A direct cast reads garbage and walks past the
++ * end of the array, so convert explicitly.
++ */
++static void apple_gfx_modes_to_lagfx(lagfx_display_mode_t *out,
++                                     const AppleGFXDisplayMode *in,
++                                     unsigned count) {
++    for (unsigned i = 0; i < count; ++i) {
++        out[i].width_px  = in[i].width_px;
++        out[i].height_px = in[i].height_px;
++        out[i].refresh_rate_hz = in[i].refresh_rate_hz;
++    }
++}
++
++static const AppleGFXDisplayMode apple_gfx_default_modes[] = {
++    { 1920, 1080, 60 },
++    { 1440, 1080, 60 },
++    { 1280, 1024, 60 },
++};
++
++static Error *apple_gfx_mig_blocker;
++static uint32_t next_pgdisplay_serial_num = 1;
++
++/* ------ Memory Task Management ------ */
++
++/*
++ * Translate a guest-physical range to a host pointer for direct access.
++ *
++ * Returns NULL if the range crosses a non-RAM region, if the region
++ * cannot be accessed directly (e.g. MMIO, ROM with writes, coalesced),
++ * or if the translation is shorter than requested.
++ *
++ * On success *mapping_in_region is set to the backing MemoryRegion; the
++ * caller must memory_region_ref() it if retaining the pointer beyond the
++ * current RCU critical section.
++ *
++ * Semantically equivalent to apple_gfx_host_ptr_for_gpa_range() in the
++ * upstream Darwin/mach port (hw/display/apple-gfx.m).
++ */
++static void *
++apple_gfx_host_ptr_for_gpa_range(uint64_t guest_physical,
++                                 uint64_t length, bool read_only,
++                                 MemoryRegion **mapping_in_region)
++{
++    MemoryRegion *ram_region;
++    char *host_ptr;
++    hwaddr ram_region_offset = 0;
++    hwaddr ram_region_length = length;
++
++    ram_region = address_space_translate(&address_space_memory,
++                                         guest_physical,
++                                         &ram_region_offset,
++                                         &ram_region_length, !read_only,
++                                         MEMTXATTRS_UNSPECIFIED);
++
++    if (!ram_region || ram_region_length < length ||
++        !memory_access_is_direct(ram_region, !read_only,
++                                 MEMTXATTRS_UNSPECIFIED)) {
++        return NULL;
++    }
++
++    host_ptr = memory_region_get_ram_ptr(ram_region);
++    if (!host_ptr) {
++        return NULL;
++    }
++    host_ptr += ram_region_offset;
++    *mapping_in_region = ram_region;
++    return host_ptr;
++}
++
++/*
++ * Shell callback: create a reserved virtual address range.
++ *
++ * Wraps lagfx_task_create(), which performs the underlying
++ * mmap(PROT_NONE) reservation inside the library.
++ * Returns the opaque lagfx_task_t handle - libapplegfx passes this back
++ * to us in later map/unmap/destroy calls so we can find the matching
++ * AppleGFXLinuxTask bookkeeping entry.
++ *
++ * On allocation failure returns NULL; libapplegfx treats this as
++ * "task creation failed" and propagates the error through its own
++ * control paths. We cannot raise a QEMU Error** here because the
++ * shell-callback signature is error-code-only.
++ */
++lagfx_task_t *
++apple_gfx_create_task(void *opaque, uint64_t vm_size, void **base_address_out)
++{
++    AppleGFXLinuxState *s = opaque;
++    AppleGFXLinuxTask *task;
++    lagfx_task_t *lagfx_task;
++    void *base_addr = NULL;
++
++    /* Reserve the VA range via libapplegfx-vulkan's memfd-backed helper. */
++    lagfx_task = lagfx_task_create((size_t)vm_size, &base_addr);
++    if (!lagfx_task) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                       "apple-gfx: lagfx_task_create(vm_size=0x%" PRIx64
++                       ") failed\n", vm_size);
++        *base_address_out = NULL;
++        return NULL;
++    }
++
++    task = g_new0(AppleGFXLinuxTask, 1);
++    task->lagfx_task = lagfx_task;
++    task->base_address = base_addr;
++    task->size = vm_size;
++    task->mapped_regions = g_ptr_array_sized_new(2 /* usually enough */);
++
++    QEMU_LOCK_GUARD(&s->task_mutex);
++    QTAILQ_INSERT_TAIL(&s->tasks, task, node);
++
++    *base_address_out = base_addr;
++
++    return lagfx_task;
++}
++
++void
++apple_gfx_destroy_task(void *opaque, lagfx_task_t *task)
++{
++    AppleGFXLinuxState *s = opaque;
++    AppleGFXLinuxTask *linux_task = NULL;
++    AppleGFXLinuxTask *it;
++
++    WITH_QEMU_LOCK_GUARD(&s->task_mutex) {
++        QTAILQ_FOREACH(it, &s->tasks, node) {
++            if (it->lagfx_task == task) {
++                linux_task = it;
++                QTAILQ_REMOVE(&s->tasks, linux_task, node);
++                break;
++            }
++        }
++    }
++
++    if (!linux_task) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                       "apple-gfx: destroy_task for unknown handle %p\n", task);
++        return;
++    }
++
++
++    /* Drop MemoryRegion references taken during map_memory. */
++    if (linux_task->mapped_regions) {
++        for (guint i = 0; i < linux_task->mapped_regions->len; ++i) {
++            MemoryRegion *region =
++                g_ptr_array_index(linux_task->mapped_regions, i);
++            memory_region_unref(region);
++        }
++        g_ptr_array_unref(linux_task->mapped_regions);
++    }
++
++    /* Release the VA reservation + memfd backing. */
++    lagfx_task_destroy(task);
++
++    g_free(linux_task);
++}
++
++/*
++ * Shell callback: map one or more guest-physical ranges into the task's
++ * reserved VA range, starting at virtual_offset. Matching Apple's
++ * mapMemory contract, ranges are packed contiguously: virtual_offset
++ * advances by each range's length as we walk the list.
++ *
++ * For each range we translate GPA -> host pointer (via QEMU's address-
++ * space machinery), take a ref on the backing MemoryRegion, and hand
++ * the host pointer to lagfx_task_map_host_memory(). The library handles
++ * the memfd + mmap(MAP_FIXED) mechanics internally.
++ *
++ * Note: the current library implementation copies the host-addr contents
++ * into the memfd on map; a future optimisation may share pages directly.
++ * From this shell's view the
++ * contract is "after this returns true, guest-visible writes to GPA are
++ * reflected in the task VA range" - verified for read-mostly ranges only.
++ */
++bool
++apple_gfx_map_memory(void *opaque, lagfx_task_t *task,
++                     uint64_t virtual_offset,
++                     const lagfx_physical_range_t *ranges,
++                     size_t range_count, bool read_only)
++{
++    AppleGFXLinuxState *s = opaque;
++    AppleGFXLinuxTask *linux_task = NULL;
++    AppleGFXLinuxTask *it;
++    /*
++     * Track per-range state for proper unwind on partial failure:
++     *  - mapped[i]:    lagfx_task_map_host_memory succeeded for this range
++     *                  (so it must be unmapped on rollback).
++     *  - new_region[i]: the MemoryRegion was first ref'd by *this* call
++     *                   (so its ref must be dropped on rollback). A region
++     *                   already in linux_task->mapped_regions before we
++     *                   started keeps its existing ref.
++     */
++    g_autofree bool *mapped = g_new0(bool, range_count > 0 ? range_count : 1);
++    g_autofree MemoryRegion **new_region =
++        g_new0(MemoryRegion *, range_count > 0 ? range_count : 1);
++    uint64_t base_virtual_offset = virtual_offset;
++    uint64_t cur_virtual_offset = virtual_offset;
++    bool success = true;
++    size_t fail_index = 0;
++
++
++    RCU_READ_LOCK_GUARD();
++    QEMU_LOCK_GUARD(&s->task_mutex);
++
++    QTAILQ_FOREACH(it, &s->tasks, node) {
++        if (it->lagfx_task == task) {
++            linux_task = it;
++            break;
++        }
++    }
++    if (!linux_task) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                       "apple-gfx: map_memory for unknown task handle %p\n",
++                       task);
++        return false;
++    }
++
++    for (size_t i = 0; i < range_count; i++) {
++        const lagfx_physical_range_t *range = &ranges[i];
++        MemoryRegion *region = NULL;
++        void *host_ptr;
++
++
++        host_ptr =
++            apple_gfx_host_ptr_for_gpa_range(range->guest_physical_address,
++                                             range->length, read_only,
++                                             &region);
++        if (!host_ptr) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "apple-gfx: map_memory: GPA 0x%" PRIx64
++                          " len 0x%" PRIx64 " not directly accessible\n",
++                          range->guest_physical_address, range->length);
++            success = false;
++            fail_index = i;
++            break;
++        }
++
++        /*
++         * Take a fresh ref only the first time we see this region in
++         * this task; track it so we can drop it on rollback.
++         */
++        if (!g_ptr_array_find(linux_task->mapped_regions, region, NULL)) {
++            g_ptr_array_add(linux_task->mapped_regions, region);
++            memory_region_ref(region);
++            new_region[i] = region;
++        }
++
++        if (!lagfx_task_map_host_memory(task, cur_virtual_offset, host_ptr,
++                                          range->length, read_only)) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "apple-gfx: lagfx_task_map_host_memory failed"
++                          " at task_offset=0x%" PRIx64 " len=0x%" PRIx64 "\n",
++                          cur_virtual_offset, range->length);
++            success = false;
++            fail_index = i;
++            break;
++        }
++        mapped[i] = true;
++        cur_virtual_offset += range->length;
++    }
++
++    if (!success) {
++        /*
++         * Roll back everything done in this call so the caller sees an
++         * all-or-nothing map.
++         */
++        uint64_t rollback_offset = base_virtual_offset;
++        for (size_t i = 0; i < fail_index; i++) {
++            if (mapped[i]) {
++                lagfx_task_unmap(task, rollback_offset, ranges[i].length);
++            }
++            rollback_offset += ranges[i].length;
++        }
++        for (size_t i = 0; i <= fail_index && i < range_count; i++) {
++            if (new_region[i]) {
++                g_ptr_array_remove_fast(linux_task->mapped_regions,
++                                        new_region[i]);
++                memory_region_unref(new_region[i]);
++            }
++        }
++    }
++
++    return success;
++}
++
++bool
++apple_gfx_unmap_memory(void *opaque, lagfx_task_t *task,
++                       uint64_t virtual_offset, uint64_t length)
++{
++    (void)opaque;
++
++
++    if (!lagfx_task_unmap(task, virtual_offset, length)) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                       "apple-gfx: lagfx_task_unmap failed"
++                       " at offset=0x%" PRIx64 " len=0x%" PRIx64 "\n",
++                      virtual_offset, length);
++        return false;
++    }
++    return true;
++}
++
++bool
++apple_gfx_read_memory(void *opaque, uint64_t guest_physical_address,
++                      uint64_t length, void *dst)
++{
++    MemTxResult r;
++
++    /*
++     * opaque holds the AppleGFXLinuxState but the DMA engine is
++     * addressed directly via address_space_memory, so the caller
++     * state is not needed here. Keep the argument for ABI
++     * symmetry with the other libapplegfx-vulkan callbacks.
++     */
++    (void)opaque;
++
++
++    /* Use QEMU's DMA engine to read guest RAM into dst */
++    r = dma_memory_read(&address_space_memory, guest_physical_address,
++                        dst, length, MEMTXATTRS_UNSPECIFIED);
++
++    return (r == MEMTX_OK);
++}
++
++bool
++apple_gfx_write_memory(void *opaque, uint64_t guest_physical_address,
++                       uint64_t length, const void *src)
++{
++    MemTxResult r;
++
++    (void)opaque;
++
++
++    r = dma_memory_write(&address_space_memory, guest_physical_address,
++                         src, length, MEMTXATTRS_UNSPECIFIED);
++
++    return (r == MEMTX_OK);
++}
++
++/* ------ Interrupt Injection ------ */
++
++typedef struct {
++    PCIDevice *device;
++    uint32_t vector;
++} AppleGFXInterruptJob;
++
++static void
++apple_gfx_raise_interrupt_bh(void *opaque)
++{
++    AppleGFXInterruptJob *job = opaque;
++
++    if (msi_enabled(job->device)) {
++        msi_notify(job->device, job->vector);
++    }
++    g_free(job);
++}
++
++void
++apple_gfx_raise_interrupt(void *opaque, uint32_t vector)
++{
++    AppleGFXInterruptJob *job;
++    /* opaque is the AppleGFXLinuxState; extract PCIDevice parent */
++    AppleGFXLinuxState *s = opaque;
++    PCIDevice *pci_dev = &s->parent_obj;
++
++
++    job = g_malloc0(sizeof(*job));
++    job->device = pci_dev;
++    job->vector = vector;
++
++    aio_bh_schedule_oneshot(qemu_get_aio_context(),
++                            apple_gfx_raise_interrupt_bh, job);
++}
++
++/* ------ Display Callbacks ------ */
++
++/* BQL is required for dpy_gfx_update + DisplaySurface mutation. */
++static void
++apple_gfx_frame_ready_bh(void *opaque)
++{
++    AppleGFXLinuxState *s = opaque;
++    void *dst;
++    size_t stride;
++    size_t width_px;
++    size_t height_px;
++    size_t dst_size;
++    size_t stride_out = 0;
++    bool new_frame = false;
++    lagfx_status_t r;
++
++    BQL_LOCK_GUARD();
++
++    if (qatomic_read(&s->pending_frames) <= 0 || !s->lagfx_disp) {
++        if (qatomic_read(&s->pending_frames) > 0) {
++            qatomic_fetch_sub(&s->pending_frames, 1);
++        }
++        return;
++    }
++    qatomic_fetch_sub(&s->pending_frames, 1);
++
++    if (!s->surface) {
++        s->surface = qemu_create_displaysurface(1920, 1080);
++        dpy_gfx_replace_surface(s->con, s->surface);
++    }
++
++    dst      = surface_data(s->surface);
++    stride   = surface_stride(s->surface);
++    width_px = surface_width(s->surface);
++    height_px = surface_height(s->surface);
++    dst_size = stride * height_px;
++
++    r = lagfx_display_read_frame(s->lagfx_disp, dst, dst_size,
++                                 &stride_out, &new_frame);
++
++    if (r == LAGFX_OK && new_frame) {
++        if (stride_out != 0 && stride_out != stride) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "apple-gfx: stride mismatch: surface=%zu "
++                          "library=%zu (frame may tear)\n",
++                          stride, stride_out);
++        }
++        qemu_log_mask(LOG_TRACE,
++                      "apple-gfx: frame dispatched to DisplaySurface "
++                      "(%zux%zu, stride=%zu)\n",
++                      width_px, height_px, stride);
++        dpy_gfx_update(s->con, 0, 0, (int)width_px, (int)height_px);
++    } else if (r == LAGFX_ERR_NO_FRAME) {
++        /* Hot path while the renderer is still warming up - silent. */
++    } else if (r != LAGFX_OK) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "apple-gfx: lagfx_display_read_frame failed "
++                      "(status=%d)\n", (int)r);
++    }
++
++    if (qatomic_read(&s->pending_frames) > 0) {
++        aio_bh_schedule_oneshot(qemu_get_aio_context(),
++                                apple_gfx_frame_ready_bh, opaque);
++    }
++}
++
++static void
++apple_gfx_vblank_tick(void *opaque)
++{
++    AppleGFXLinuxState *s = opaque;
++
++
++    /*
++     * Tick may have been queued before unrealize completed; lagfx_dev
++     * is NULLed on teardown - skip the call to avoid a UAF.
++     */
++    if (!s->lagfx_dev) {
++        return;
++    }
++
++    /* initial_surface_pushed */
++    if (!s->initial_surface_pushed) {
++        dpy_gfx_update_full(s->con);
++        s->initial_surface_pushed = true;
++    }
++
++    lagfx_timer_tick_vblank(s->lagfx_dev, s,
++                               apple_gfx_write_memory, apple_gfx_read_memory);
++    timer_mod(&s->vblank_timer,
++              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
++              NANOSECONDS_PER_SECOND / 60);
++}
++
++static void
++apple_gfx_frame_ready(void *opaque)
++{
++    AppleGFXLinuxState *s = opaque;
++    uint32_t prev;
++
++    /*
++     * Cap pending at 2 with two-step cmpxchg.
++     *  - cmpxchg(0,1): no work in flight, schedule one BH.
++     *  - cmpxchg(1,2): one in flight, queue exactly one more.
++     *  - prev >= 2:    already capped, drop this notification.
++     * Both reads come from cmpxchg's atomic return value - never a
++     * non-atomic re-read of pending_frames.
++     */
++    prev = qatomic_cmpxchg(&s->pending_frames, 0, 1);
++    if (prev != 0) {
++        prev = qatomic_cmpxchg(&s->pending_frames, 1, 2);
++        if (prev != 1) {
++            /*
++             * prev was 0 (a concurrent caller already drained), or
++             * prev was >=2 (already at cap). Either way: nothing to do.
++             */
++            return;
++        }
++        /*
++         * We bumped 1 -> 2; the in-flight BH will reschedule itself
++         * via the tail of apple_gfx_frame_ready_bh, so don't schedule
++         * another one here.
++         */
++        return;
++    }
++
++
++    aio_bh_schedule_oneshot(qemu_get_aio_context(),
++                            apple_gfx_frame_ready_bh, opaque);
++}
++
++static void
++apple_gfx_mode_changed(void *opaque, uint32_t width_px, uint32_t height_px)
++{
++    AppleGFXLinuxState *s = opaque;
++
++
++    BQL_LOCK_GUARD();
++
++    if (s->surface &&
++        width_px == surface_width(s->surface) &&
++        height_px == surface_height(s->surface)) {
++        return;
++    }
++
++    s->surface = qemu_create_displaysurface(width_px, height_px);
++    dpy_gfx_replace_surface(s->con, s->surface);
++}
++
++/*
++ * Cursor glyph callback (libapplegfx opcode 0x14
++ * CmdDisplayCursorGlyph). Invoked from a libapplegfx render thread
++ * with no BQL held; s->cursor and dpy_cursor_define() require the
++ * BQL, so we build the QEMUCursor here, transfer ownership to a BH,
++ * and let the BH do the swap + push.
++ *
++ * Pixel format: bgra_pixels arrives as BGRA (the display pipe
++ * byte-swaps the kext's ARGB before handing it off); QEMUCursor
++ * expects RGBA, so we reorder while copying.
++ */
++typedef struct {
++    AppleGFXLinuxState *s;
++    QEMUCursor *cursor;
++} AppleGFXCursorGlyphJob;
++
++static void
++apple_gfx_cursor_glyph_bh(void *opaque)
++{
++    AppleGFXCursorGlyphJob *job = opaque;
++    AppleGFXLinuxState *s = job->s;
++
++    BQL_LOCK_GUARD();
++
++    if (s->cursor) {
++        cursor_unref(s->cursor);
++    }
++    s->cursor = job->cursor;
++    dpy_cursor_define(s->con, s->cursor);
++
++    g_free(job);
++}
++
++static void
++apple_gfx_cursor_glyph(void *opaque,
++                         const uint8_t *bgra_pixels,
++                         uint32_t width, uint32_t height,
++                         lagfx_coord_t hotspot)
++{
++    AppleGFXLinuxState *s = opaque;
++    AppleGFXCursorGlyphJob *job;
++    QEMUCursor *cursor;
++    uint32_t *dest_px;
++    const uint8_t *src_px;
++
++    /* BPP is always 32 for QEMU cursors. */
++
++    cursor = cursor_alloc(width, height);
++    cursor->hot_x = hotspot.x;
++    cursor->hot_y = hotspot.y;
++
++    dest_px = cursor->data;
++    src_px = bgra_pixels;
++    for (uint32_t y = 0; y < height; ++y) {
++        for (uint32_t x = 0; x < width; ++x) {
++            *dest_px = (src_px[2] << 16u) |  /* R */
++                       (src_px[1] <<  8u) |  /* G */
++                       (src_px[0] <<  0u) |  /* B */
++                       (src_px[3] << 24u);   /* A */
++            ++dest_px;
++            src_px += 4;
++        }
++    }
++
++    job = g_new0(AppleGFXCursorGlyphJob, 1);
++    job->s = s;
++    job->cursor = cursor;
++
++    aio_bh_schedule_oneshot(qemu_get_aio_context(),
++                             apple_gfx_cursor_glyph_bh, job);
++}
++
++static void
++apple_gfx_cursor_moved_bh(void *opaque)
++{
++    AppleGFXLinuxState *s = opaque;
++
++    BQL_LOCK_GUARD();
++    /*
++     * Read lagfx_disp under the BQL: unrealize frees/NULLs it under the
++     * BQL, so reading it before taking the lock would be a use-after-free.
++     */
++    if (!s->lagfx_disp) {
++        return;
++    }
++    lagfx_coord_t pos = lagfx_display_cursor_position(s->lagfx_disp);
++    dpy_mouse_set(s->con, pos.x, pos.y, s->cursor_show);
++}
++
++/* libapplegfx opcode 0x13 CmdDisplayCursorShow (position field). */
++static void
++apple_gfx_cursor_moved(void *opaque)
++{
++    aio_bh_schedule_oneshot(qemu_get_aio_context(),
++                             apple_gfx_cursor_moved_bh, opaque);
++}
++
++/* libapplegfx opcode 0x13 CmdDisplayCursorShow (visible field). */
++static void
++apple_gfx_cursor_show(void *opaque, bool show)
++{
++    AppleGFXLinuxState *s = opaque;
++
++    s->cursor_show = show;
++
++    aio_bh_schedule_oneshot(qemu_get_aio_context(),
++                             apple_gfx_cursor_moved_bh, opaque);
++}
++
++/* ------ MMIO Read/Write ------ */
++
++uint64_t
++apple_gfx_mmio_read(void *opaque, hwaddr offset, unsigned size)
++{
++    AppleGFXLinuxState *s = opaque;
++    uint32_t value;
++
++    /* libapplegfx-vulkan handles MMIO dispatch */
++    value = lagfx_mmio_read(s->lagfx_dev, offset);
++
++    return value;
++}
++
++void
++apple_gfx_mmio_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
++{
++    AppleGFXLinuxState *s = opaque;
++
++    /* libapplegfx-vulkan handles MMIO dispatch */
++    lagfx_mmio_write(s->lagfx_dev, offset, (uint32_t)val);
++
++}
++
++static const MemoryRegionOps apple_gfx_mmio_ops = {
++    .read = apple_gfx_mmio_read,
++    .write = apple_gfx_mmio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++/* ------ Device Initialization ------ */
++
++void
++apple_gfx_common_init(Object *obj, AppleGFXLinuxState *s)
++{
++    /* Default MMIO region size; libapplegfx may override */
++    size_t mmio_range_size = 0x4000;  /* 16 KB default */
++
++
++    memory_region_init_io(&s->iomem_gfx, obj, &apple_gfx_mmio_ops, s,
++                          "apple-gfx-mmio", mmio_range_size);
++
++    qemu_mutex_init(&s->task_mutex);
++    QTAILQ_INIT(&s->tasks);
++
++    s->cursor_show = true;
++}
++
++bool
++apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
++                         lagfx_device_descriptor_t *desc, Error **errp)
++{
++    const AppleGFXDisplayMode *display_modes = apple_gfx_default_modes;
++    uint32_t num_display_modes = ARRAY_SIZE(apple_gfx_default_modes);
++    lagfx_display_descriptor_t disp_desc;
++    char *errp_lagfx = NULL;
++
++    if (apple_gfx_mig_blocker == NULL) {
++        error_setg(&apple_gfx_mig_blocker,
++                   "Migration state blocked by apple-gfx display device");
++        if (migrate_add_blocker(&apple_gfx_mig_blocker, errp) < 0) {
++            return false;
++        }
++    }
++
++    /* Create the paravirt GPU device via libapplegfx */
++    s->lagfx_dev = lagfx_device_new(desc, &errp_lagfx);
++    if (!s->lagfx_dev) {
++        error_setg(errp, "Failed to create lagfx_device: %s",
++                   errp_lagfx ? errp_lagfx : "unknown");
++        g_free(errp_lagfx);
++        return false;
++    }
++
++    /* Prepare display descriptor */
++    memset(&disp_desc, 0, sizeof(disp_desc));
++    disp_desc.name = "QEMU display";
++    disp_desc.size_mm_width = 400;   /* 20" display */
++    disp_desc.size_mm_height = 300;
++
++    /*
++     * Convert AppleGFXDisplayMode (3x uint16_t) to lagfx_display_mode_t
++     * (3x uint32_t). Can't cast directly - different layout.
++     */
++    static lagfx_display_mode_t converted_modes[4];
++    unsigned mode_count =
++        s->display_modes ? s->num_display_modes : num_display_modes;
++    /*
++     * converted_modes[] holds 4; mode_count is user-controlled
++     * (display-modes property): clamp, or apple_gfx_modes_to_lagfx
++     * overflows the stack.
++     */
++    if (mode_count > 4u) {
++        mode_count = 4u;
++    }
++    const AppleGFXDisplayMode *src_modes =
++        s->display_modes ? s->display_modes : display_modes;
++    apple_gfx_modes_to_lagfx(converted_modes, src_modes, mode_count);
++    disp_desc.modes = converted_modes;
++    disp_desc.mode_count = mode_count;
++
++    disp_desc.callbacks.opaque = s;
++    disp_desc.callbacks.frame_ready = apple_gfx_frame_ready;
++    disp_desc.callbacks.mode_changed = apple_gfx_mode_changed;
++    disp_desc.callbacks.cursor_glyph = apple_gfx_cursor_glyph;
++    disp_desc.callbacks.cursor_moved = apple_gfx_cursor_moved;
++    disp_desc.callbacks.cursor_show = apple_gfx_cursor_show;
++
++    static const GraphicHwOps apple_gfx_hw_ops = {
++        .gfx_update = NULL,
++        .gfx_update_async = true,
++    };
++
++    s->con = graphic_console_init(dev, 0, &apple_gfx_hw_ops, s);
++
++    s->surface = qemu_create_displaysurface(1920, 1080);
++    dpy_gfx_replace_surface(s->con, s->surface);
++
++    /*
++     * Create display - may synchronously call apple_gfx_mode_changed.
++     * Console + surface above must already be set.
++     */
++    s->lagfx_disp = lagfx_display_new(s->lagfx_dev, &disp_desc,
++                                      0, /* port */
++                                      next_pgdisplay_serial_num++,
++                                      &errp_lagfx);
++    if (!s->lagfx_disp) {
++        error_setg(errp, "Failed to create lagfx_display: %s",
++                   errp_lagfx ? errp_lagfx : "unknown");
++
++        /*
++         * dpy_gfx_replace_surface(NULL) takes ownership and frees the
++         * prior surface; do NOT call qemu_free_displaysurface() after
++         * it (double-free).
++         */
++        if (s->con && s->surface) {
++            dpy_gfx_replace_surface(s->con, NULL);
++            s->surface = NULL;
++        }
++
++        /* Unregister migration blocker so a retry can re-add it. */
++        migrate_del_blocker(&apple_gfx_mig_blocker);
++
++        /*
++         * Free lagfx_dev *before* NULLing the field - passing NULL to
++         * lagfx_device_free would leak the underlying allocation.
++         */
++        lagfx_device_free(s->lagfx_dev);
++        s->lagfx_dev = NULL;
++
++        g_free(errp_lagfx);
++        return false;
++    }
++
++    /*
++     * 60 Hz vblank tick. Also performs the initial dpy_gfx_update_full -
++     * doing it from realize segfaults because VNC/SDL backends aren't
++     * wired into the QemuConsole's listener chain until vCPU start.
++     */
++    timer_init_ns(&s->vblank_timer, QEMU_CLOCK_REALTIME,
++                  apple_gfx_vblank_tick, s);
++    uint64_t next_fire = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
++                          NANOSECONDS_PER_SECOND / 60;
++    timer_mod(&s->vblank_timer, next_fire);
++
++    return true;
++}
++
++/* ------ Display Mode Property Getters/Setters ------ */
++
++static void
++apple_gfx_get_display_mode(Object *obj, Visitor *v,
++                            const char *name, void *opaque, Error **errp)
++{
++    Property *prop = opaque;
++    AppleGFXDisplayMode *mode = object_field_prop_ptr(obj, prop);
++    char buffer[64];
++
++    snprintf(buffer, sizeof(buffer),
++             "%"PRIu16"x%"PRIu16"@%"PRIu16,
++             mode->width_px, mode->height_px, mode->refresh_rate_hz);
++
++    visit_type_str(v, name, &(char *){ buffer }, errp);
++}
++
++static void
++apple_gfx_set_display_mode(Object *obj, Visitor *v,
++                            const char *name, void *opaque, Error **errp)
++{
++    Property *prop = opaque;
++    AppleGFXDisplayMode *mode = object_field_prop_ptr(obj, prop);
++    const char *endptr;
++    g_autofree char *str = NULL;
++    int ret, val;
++
++    if (!visit_type_str(v, name, &str, errp)) {
++        return;
++    }
++
++    endptr = str;
++
++    /* Parse width */
++    ret = qemu_strtoi(endptr, &endptr, 10, &val);
++    if (ret || val > UINT16_MAX || val <= 0) {
++        error_setg(errp, "width in '%s' must be 1..65535", name);
++        return;
++    }
++    mode->width_px = val;
++
++    if (*endptr != 'x') {
++        error_setg(errp, "format must be <width>x<height>@<rate>");
++        return;
++    }
++
++    /* Parse height */
++    ret = qemu_strtoi(endptr + 1, &endptr, 10, &val);
++    if (ret || val > UINT16_MAX || val <= 0) {
++        error_setg(errp, "height in '%s' must be 1..65535", name);
++        return;
++    }
++    mode->height_px = val;
++
++    if (*endptr != '@') {
++        error_setg(errp, "format must be <width>x<height>@<rate>");
++        return;
++    }
++
++    /* Parse refresh rate */
++    ret = qemu_strtoi(endptr + 1, &endptr, 10, &val);
++    if (ret || val > UINT16_MAX || val <= 0) {
++        error_setg(errp, "refresh rate in '%s' must be positive", name);
++        return;
++    }
++    mode->refresh_rate_hz = val;
++}
++
++const PropertyInfo qdev_prop_apple_gfx_display_mode = {
++    .type = "display_mode",
++    .description = "Display mode as <width>x<height>@<refresh-rate>. "
++                   "Example: 3840x2160@60",
++    .get = apple_gfx_get_display_mode,
++    .set = apple_gfx_set_display_mode,
++};
+diff --git a/hw/display/apple-gfx-linux.h b/hw/display/apple-gfx-linux.h
+new file mode 100644
+index 000000000..838da3ba8
+--- /dev/null
++++ b/hw/display/apple-gfx-linux.h
+@@ -0,0 +1,123 @@
++/*
++ * QEMU Apple ParavirtualizedGraphics.framework device - Linux C variant
++ * Local header for apple-gfx-pci-linux.c and apple-gfx-common-linux.c
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef QEMU_APPLE_GFX_LINUX_H
++#define QEMU_APPLE_GFX_LINUX_H
++
++#include "qemu/osdep.h"
++#include "hw/pci/pci_device.h"
++#include "ui/console.h"
++#include "system/memory.h"
++#include <libapplegfx-vulkan.h>
++
++/*
++ * Task-memory management: Linux variant.
++ *
++ * Each task owns a reserved VA range backed by libapplegfx-vulkan's
++ * memfd-based lagfx_task. When map_memory is invoked, we translate each
++ * guest-physical range to a host pointer via address_space_translate(),
++ * then hand that pointer to lagfx_task_map_host_memory(). We ref the
++ * backing MemoryRegion to keep it alive for the mapping's lifetime.
++ */
++typedef struct AppleGFXLinuxTask {
++    QTAILQ_ENTRY(AppleGFXLinuxTask) node;
++    lagfx_task_t *lagfx_task;  /* opaque handle from lagfx_task_create */
++    void *base_address;        /* reserved VA base, from lagfx_task_create */
++    uint64_t size;             /* reserved VA range length */
++    GPtrArray *mapped_regions; /* MemoryRegions ref'd for this task */
++} AppleGFXLinuxTask;
++
++typedef QTAILQ_HEAD(, AppleGFXLinuxTask) AppleGFXLinuxTaskList;
++
++/* Display mode */
++typedef struct {
++    uint16_t width_px;
++    uint16_t height_px;
++    uint16_t refresh_rate_hz;
++} AppleGFXDisplayMode;
++
++/* Main device state - replaces Obj-C AppleGFXState */
++typedef struct AppleGFXLinuxState {
++    PCIDevice parent_obj;
++
++    /* MMIO register space */
++    MemoryRegion iomem_gfx;
++
++    /* libapplegfx-vulkan handles */
++    lagfx_device_t *lagfx_dev;
++    lagfx_display_t *lagfx_disp;
++
++    /* QEMU display integration */
++    QemuConsole *con;
++    DisplaySurface *surface;
++
++    /* Task/memory management (protected by task_mutex) */
++    QemuMutex task_mutex;
++    AppleGFXLinuxTaskList tasks;
++
++    /* Cursor and mode state (BQL protected) */
++    QEMUCursor *cursor;
++    bool cursor_show;
++
++    /* Display modes (from device properties) */
++    AppleGFXDisplayMode *display_modes;
++    uint32_t num_display_modes;
++
++    /*
++     * Per-VM lavapipe worker-thread budget (from -device gpu_cores=N).
++     * 0 = unset; let lavapipe pick its default (host core count).
++     * Copied into lagfx_device_descriptor_t::thread_count at realize
++     * time, where the library translates it into LP_NUM_THREADS before
++     * the first Vulkan call. Process-global: if multiple apple-gfx-pci
++     * devices are created in one QEMU process (an atypical deploy; the
++     * single-VM-per-process case is the tested path), the first
++     * non-zero value wins. Reset-only; changes after QEMU start are
++     * not picked up.
++     */
++    uint32_t gpu_cores;
++
++    /* Frame rendering state */
++    int8_t pending_frames;
++    QEMUTimer vblank_timer;
++    bool initial_surface_pushed;
++} AppleGFXLinuxState;
++
++/* Function declarations shared between -pci-linux.c and -common-linux.c */
++
++extern const PropertyInfo qdev_prop_apple_gfx_display_mode;
++
++void apple_gfx_common_init(Object *obj, AppleGFXLinuxState *s);
++bool apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
++                              lagfx_device_descriptor_t *desc, Error **errp);
++
++/* Memory-region MemoryRegionOps handlers (common) */
++uint64_t apple_gfx_mmio_read(void *opaque, hwaddr offset, unsigned size);
++void apple_gfx_mmio_write(void *opaque, hwaddr offset, uint64_t val,
++                          unsigned size);
++
++/*
++ * libapplegfx shell callbacks implemented in apple-gfx-common-linux.c.
++ * These are populated into lagfx_device_descriptor_t::shell by the PCI (and
++ * future MMIO) transport variants, so their addresses must be visible across
++ * translation units - hence extern here instead of file-local static.
++ */
++lagfx_task_t *apple_gfx_create_task(void *opaque, uint64_t vm_size,
++                                    void **base_address_out);
++void apple_gfx_destroy_task(void *opaque, lagfx_task_t *task);
++bool apple_gfx_map_memory(void *opaque, lagfx_task_t *task,
++                          uint64_t virtual_offset,
++                          const lagfx_physical_range_t *ranges,
++                          size_t range_count, bool read_only);
++bool apple_gfx_unmap_memory(void *opaque, lagfx_task_t *task,
++                            uint64_t virtual_offset, uint64_t length);
++bool apple_gfx_read_memory(void *opaque, uint64_t guest_physical_address,
++                           uint64_t length, void *dst);
++bool apple_gfx_write_memory(void *opaque, uint64_t guest_physical_address,
++                            uint64_t length, const void *src);
++void apple_gfx_raise_interrupt(void *opaque, uint32_t vector);
++
++#endif /* QEMU_APPLE_GFX_LINUX_H */
+diff --git a/hw/display/apple-gfx-pci-linux.c b/hw/display/apple-gfx-pci-linux.c
+new file mode 100644
+index 000000000..7d4642695
+--- /dev/null
++++ b/hw/display/apple-gfx-pci-linux.c
+@@ -0,0 +1,281 @@
++/*
++ * QEMU Apple ParavirtualizedGraphics.framework device, PCI variant, for
++ * Linux hosts.
++ *
++ * Copyright (c) 2026 Matthew Jackson <matthew@pq.io>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * C port of the macOS-host apple-gfx-pci.m device (Phil Dennis-Jordan),
++ * providing the same guest-visible PCI device backed by the external
++ * libapplegfx-vulkan library instead of Apple's
++ * ParavirtualizedGraphics.framework.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/error-report.h"
++#include "qemu/main-loop.h"
++#include "qemu/aio.h"
++#include "hw/pci/pci_device.h"
++#include "hw/pci/msi.h"
++#include "hw/core/qdev-properties.h"
++#include "apple-gfx-linux.h"
++
++/*
++ * Upper bound on the `gpu_cores` property. Leaves headroom above Mesa
++ * lavapipe's historical compile-time cap (LP_MAX_THREADS = 32) while
++ * staying in sensible host territory; values above this clamp to
++ * LAGFX_GPU_CORES_MAX with a warning.
++ */
++#define LAGFX_GPU_CORES_MAX 64u
++
++/*
++ * PCI device identification. AppleParavirtGPU.kext matches on
++ * IOPCIMatch = "0xEEEE106B", which IOKit encodes as
++ * (device_id << 16) | vendor_id, hence vendor=0x106B, device=0xEEEE.
++ */
++#define PG_PCI_VENDOR_ID 0x106B
++#define PG_PCI_DEVICE_ID 0xEEEE
++#define PG_PCI_SUBSYSTEM_VENDOR_ID 0x106B
++#define PG_PCI_SUBSYSTEM_ID 0xEEEE
++#define PG_PCI_MAX_MSI_VECTORS 32
++#define PG_PCI_BAR_MMIO 0
++
++#define TYPE_APPLE_GFX_PCI "apple-gfx-pci"
++
++OBJECT_DECLARE_SIMPLE_TYPE(AppleGFXPCIState, APPLE_GFX_PCI)
++
++struct AppleGFXPCIState {
++    AppleGFXLinuxState common;
++};
++
++static void
++apple_gfx_pci_init(Object *obj)
++{
++    AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
++
++    apple_gfx_common_init(obj, &s->common);
++}
++
++static void
++apple_gfx_pci_realize(PCIDevice *pci_dev, Error **errp)
++{
++    AppleGFXPCIState *s = APPLE_GFX_PCI(pci_dev);
++    AppleGFXLinuxState *common = &s->common;
++    lagfx_device_descriptor_t device_desc;
++    int ret;
++
++    /* Register MMIO BAR */
++    pci_register_bar(pci_dev, PG_PCI_BAR_MMIO,
++                     PCI_BASE_ADDRESS_SPACE_MEMORY, &common->iomem_gfx);
++
++    /*
++     * Legacy MSI, intentionally: macOS's AppleParavirtGPU driver stalls
++     * during boot when MSI-X is advertised on this device.
++     */
++    ret = msi_init(pci_dev, 0x0 /* config offset; 0 = auto */,
++                   PG_PCI_MAX_MSI_VECTORS, true /* msi64bit */,
++                   false /* msi_per_vector_mask */, errp);
++    if (ret != 0) {
++        return;
++    }
++
++    /* Prepare device descriptor for libapplegfx */
++    memset(&device_desc, 0, sizeof(device_desc));
++
++    /* Shell callbacks (memory + interrupt) */
++    device_desc.shell.opaque = common;
++    device_desc.shell.create_task = apple_gfx_create_task;
++    device_desc.shell.destroy_task = apple_gfx_destroy_task;
++    device_desc.shell.map_memory = apple_gfx_map_memory;
++    device_desc.shell.unmap_memory = apple_gfx_unmap_memory;
++    device_desc.shell.read_memory = apple_gfx_read_memory;
++    device_desc.shell.write_memory = apple_gfx_write_memory;
++    device_desc.shell.raise_interrupt = apple_gfx_raise_interrupt;
++
++    /* MMIO region size hint (0 = use library default) */
++    device_desc.mmio_region_size = 0;
++
++    /* No pre-existing Vulkan instance */
++    device_desc.shell_vulkan_instance = NULL;
++
++    /*
++     * Plumb `gpu_cores` -> descriptor thread_count -> LP_NUM_THREADS.
++     *
++     * Clamp >64 with a warning. 0 is the "unset; lavapipe default"
++     * sentinel and passes straight through. No hard error on
++     * over-range; operators may set high values intentionally (host
++     * CPU count, cgroup limit).
++     */
++    if (common->gpu_cores > LAGFX_GPU_CORES_MAX) {
++        warn_report("apple-gfx-pci: gpu_cores=%u exceeds max %u; "
++                    "clamping (lavapipe may clamp further)",
++                    common->gpu_cores, LAGFX_GPU_CORES_MAX);
++        common->gpu_cores = LAGFX_GPU_CORES_MAX;
++    }
++    device_desc.thread_count = common->gpu_cores;
++
++    if (!apple_gfx_common_realize(common, DEVICE(pci_dev), &device_desc,
++                                  errp)) {
++        return;
++    }
++
++}
++
++static void
++apple_gfx_pci_reset(Object *obj, ResetType type)
++{
++    AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
++
++    if (s->common.lagfx_dev) {
++        lagfx_device_reset(s->common.lagfx_dev);
++    }
++
++}
++
++static void
++apple_gfx_pci_unrealize(DeviceState *dev)
++{
++    AppleGFXPCIState *s = APPLE_GFX_PCI(dev);
++
++    /*
++     * Teardown ordering matters: callbacks from libapplegfx
++     * (frame_ready, cursor_glyph, cursor_moved, cursor_show, plus
++     * raise_interrupt from MMIO) all use aio_bh_schedule_oneshot()
++     * onto the main AioContext. A BH queued before unrealize will
++     * fire afterward and dereference freed s->cursor / s->lagfx_disp /
++     * s->con - the classic post-unrealize UAF.
++     *
++     * apple_gfx_frame_ready_bh() is also self-chaining via
++     * pending_frames > 0, so a single drain isn't enough on its own -
++     * we must atomically clear pending_frames first to disarm the
++     * re-arm path at the end of that BH.
++     *
++     * Sequence:
++     *   1. Stop vblank timer (host-side BH source).
++     *   2. Free libapplegfx display + device. Per the libapplegfx-vulkan
++     *      header (lagfx_display_free / lagfx_device_free), these
++     *      "Detach + free" - we ASSUME they block until in-flight
++     *      callbacks return before yielding. The header does not
++     *      explicitly document this; if a callback fires after free
++     *      returns there is a residual race the BH-drain below cannot
++     *      close (the callback would re-enter freed state).
++     *   3. Disarm the self-chaining frame_ready_bh by setting
++     *      pending_frames to 0 - its early-return path skips re-arm
++     *      when pending_frames <= 0.
++     *   4. Drain the main AioContext to run any BHs queued before
++     *      step 2 returned. After step 3 the frame BH cannot re-arm.
++     *   5. Free remaining QEMU-side state (surface, cursor) only
++     *      after the drain - by this point no scheduled BH can touch
++     *      these fields.
++     *
++     * Note: graphic_console_init's QemuConsole and the migration
++     * blocker registered in apple_gfx_common_realize are intentionally
++     * not torn down here (pre-existing; not the focus of this fix).
++     */
++    timer_del(&s->common.vblank_timer);
++
++    /*
++     * Drain task queue before freeing device - prevents UAF if tasks
++     * reference freed state. lagfx_device_free does NOT drain tasks.
++     */
++    AppleGFXLinuxTask *task, *tmp;
++    QTAILQ_FOREACH_SAFE(task, &s->common.tasks, node, tmp) {
++        QTAILQ_REMOVE(&s->common.tasks, task, node);
++
++        /* Unref all MemoryRegions in the mapped_regions array. */
++        for (guint i = 0; i < task->mapped_regions->len; ++i) {
++            memory_region_unref(g_ptr_array_index(task->mapped_regions, i));
++        }
++        g_ptr_array_free(task->mapped_regions, TRUE);
++
++        g_free(task);
++    }
++
++    /* MSI teardown, paired with msi_init in realize. */
++    PCIDevice *pci_dev = PCI_DEVICE(dev);
++    msi_uninit(pci_dev);
++
++    if (s->common.lagfx_disp) {
++        lagfx_display_free(s->common.lagfx_disp);
++        s->common.lagfx_disp = NULL;
++    }
++
++    if (s->common.lagfx_dev) {
++        lagfx_device_free(s->common.lagfx_dev);
++        s->common.lagfx_dev = NULL;
++    }
++
++    qatomic_set(&s->common.pending_frames, 0);
++
++    aio_bh_poll(qemu_get_aio_context());
++
++    /* Drop dpy_gfx_replace_surface(NULL) to let console own surface. */
++    if (s->common.con && s->common.surface) {
++        dpy_gfx_replace_surface(s->common.con, NULL);
++    }
++
++    if (s->common.cursor) {
++        cursor_unref(s->common.cursor);
++        s->common.cursor = NULL;
++    }
++
++    qemu_mutex_destroy(&s->common.task_mutex);
++}
++
++static const Property apple_gfx_pci_properties[] = {
++    DEFINE_PROP_ARRAY("display-modes", AppleGFXPCIState,
++                      common.num_display_modes, common.display_modes,
++                      qdev_prop_apple_gfx_display_mode, AppleGFXDisplayMode),
++    /*
++     * Per-VM lavapipe worker-thread budget. 0 = let lavapipe pick its
++     * default (host core count); N > 0 sets LP_NUM_THREADS=N before
++     * Vulkan init. Accepted values 0..LAGFX_GPU_CORES_MAX; higher
++     * values are clamped at realize with a warning. Reset-only
++     * (LP_NUM_THREADS is read by Mesa once, at Vulkan-ICD init).
++     */
++    DEFINE_PROP_UINT32("gpu_cores", AppleGFXPCIState, common.gpu_cores, 0),
++};
++
++static void
++apple_gfx_pci_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    PCIDeviceClass *pci = PCI_DEVICE_CLASS(klass);
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++
++    rc->phases.hold = apple_gfx_pci_reset;
++    dc->desc = "Apple Paravirtualized Graphics PCI Display Controller (Linux)";
++    dc->hotpluggable = false;
++    dc->unrealize = apple_gfx_pci_unrealize;
++    set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
++
++    pci->vendor_id = PG_PCI_VENDOR_ID;
++    pci->device_id = PG_PCI_DEVICE_ID;
++    pci->subsystem_vendor_id = PG_PCI_SUBSYSTEM_VENDOR_ID;
++    pci->subsystem_id = PG_PCI_SUBSYSTEM_ID;
++    pci->class_id = PCI_CLASS_DISPLAY_VGA;
++    pci->realize = apple_gfx_pci_realize;
++
++    device_class_set_props(dc, apple_gfx_pci_properties);
++}
++
++static const TypeInfo apple_gfx_pci_type = {
++    .name = TYPE_APPLE_GFX_PCI,
++    .parent = TYPE_PCI_DEVICE,
++    .instance_size = sizeof(AppleGFXPCIState),
++    .class_init = apple_gfx_pci_class_init,
++    .instance_init = apple_gfx_pci_init,
++    .interfaces = (const InterfaceInfo[]) {
++        { INTERFACE_PCIE_DEVICE },
++        { },
++    },
++};
++
++static void
++apple_gfx_pci_register_types(void)
++{
++    type_register_static(&apple_gfx_pci_type);
++}
++
++type_init(apple_gfx_pci_register_types)
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index e730c289b..e84c8ff2a 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -64,6 +64,11 @@ system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_
+ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
+ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
+ 
++system_ss.add(when: [libapplegfx, 'CONFIG_APPLE_GFX_PCI_LINUX'],
++              if_true: [files('apple-gfx-pci-linux.c',
++                              'apple-gfx-common-linux.c'),
++                        libapplegfx])
++
+ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
+   virtio_gpu_ss = ss.source_set()
+   virtio_gpu_ss.add(when: 'CONFIG_VIRTIO_GPU',
+-- 
+2.50.1 (Apple Git-155)
+

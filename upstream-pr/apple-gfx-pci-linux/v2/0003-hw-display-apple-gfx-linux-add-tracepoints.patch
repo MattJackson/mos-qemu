@@ -1,0 +1,229 @@
+From 814298ca7761bab3d344b3e9536fc7ee7f6cd217 Mon Sep 17 00:00:00 2001
+From: Matthew Jackson <matthew@pq.io>
+Date: Sun, 19 Jul 2026 09:08:08 -0700
+Subject: [PATCH 3/4] hw/display/apple-gfx-linux: add tracepoints
+
+Wire the Linux-host apple-gfx port into the tracing subsystem. Where
+an event of the same shape already exists for the macOS-host
+implementation (MMIO access, task lifecycle, memory mapping, IRQ,
+frame/cursor/mode callbacks) the existing trace event is reused, so
+both implementations are observable through the same event names.
+
+Five events have no macOS-side equivalent and are added: PCI
+realize/reset, guest-memory writes, and the 60 Hz vblank timer.
+
+Signed-off-by: Matthew Jackson <matthew@pq.io>
+---
+ hw/display/apple-gfx-common-linux.c | 21 +++++++++++++++++++++
+ hw/display/apple-gfx-pci-linux.c    |  3 +++
+ hw/display/trace-events             |  8 ++++++++
+ 3 files changed, 32 insertions(+)
+
+diff --git a/hw/display/apple-gfx-common-linux.c b/hw/display/apple-gfx-common-linux.c
+index 6e7d5401c..232c16d88 100644
+--- a/hw/display/apple-gfx-common-linux.c
++++ b/hw/display/apple-gfx-common-linux.c
+@@ -27,6 +27,7 @@
+ #include "hw/pci/msi.h"
+ #include "hw/pci/pci.h"
+ #include "apple-gfx-linux.h"
++#include "trace.h"
+ 
+ 
+ /*
+@@ -142,6 +143,7 @@ apple_gfx_create_task(void *opaque, uint64_t vm_size, void **base_address_out)
+     QTAILQ_INSERT_TAIL(&s->tasks, task, node);
+ 
+     *base_address_out = base_addr;
++    trace_apple_gfx_create_task(vm_size, base_addr);
+ 
+     return lagfx_task;
+ }
+@@ -169,6 +171,8 @@ apple_gfx_destroy_task(void *opaque, lagfx_task_t *task)
+         return;
+     }
+ 
++    trace_apple_gfx_destroy_task(task, linux_task->mapped_regions
++                                 ? linux_task->mapped_regions->len : 0);
+ 
+     /* Drop MemoryRegion references taken during map_memory. */
+     if (linux_task->mapped_regions) {
+@@ -229,6 +233,7 @@ apple_gfx_map_memory(void *opaque, lagfx_task_t *task,
+     bool success = true;
+     size_t fail_index = 0;
+ 
++    trace_apple_gfx_map_memory(task, range_count, virtual_offset, read_only);
+ 
+     RCU_READ_LOCK_GUARD();
+     QEMU_LOCK_GUARD(&s->task_mutex);
+@@ -251,6 +256,8 @@ apple_gfx_map_memory(void *opaque, lagfx_task_t *task,
+         MemoryRegion *region = NULL;
+         void *host_ptr;
+ 
++        trace_apple_gfx_map_memory_range(i, range->guest_physical_address,
++                                          range->length);
+ 
+         host_ptr =
+             apple_gfx_host_ptr_for_gpa_range(range->guest_physical_address,
+@@ -320,6 +327,7 @@ apple_gfx_unmap_memory(void *opaque, lagfx_task_t *task,
+ {
+     (void)opaque;
+ 
++    trace_apple_gfx_unmap_memory(task, virtual_offset, length);
+ 
+     if (!lagfx_task_unmap(task, virtual_offset, length)) {
+         qemu_log_mask(LOG_GUEST_ERROR,
+@@ -345,6 +353,7 @@ apple_gfx_read_memory(void *opaque, uint64_t guest_physical_address,
+      */
+     (void)opaque;
+ 
++    trace_apple_gfx_read_memory(guest_physical_address, length, dst);
+ 
+     /* Use QEMU's DMA engine to read guest RAM into dst */
+     r = dma_memory_read(&address_space_memory, guest_physical_address,
+@@ -361,6 +370,7 @@ apple_gfx_write_memory(void *opaque, uint64_t guest_physical_address,
+ 
+     (void)opaque;
+ 
++    trace_apple_gfx_write_memory(guest_physical_address, length, src);
+ 
+     r = dma_memory_write(&address_space_memory, guest_physical_address,
+                          src, length, MEMTXATTRS_UNSPECIFIED);
+@@ -394,6 +404,7 @@ apple_gfx_raise_interrupt(void *opaque, uint32_t vector)
+     AppleGFXLinuxState *s = opaque;
+     PCIDevice *pci_dev = &s->parent_obj;
+ 
++    trace_apple_gfx_raise_irq(vector);
+ 
+     job = g_malloc0(sizeof(*job));
+     job->device = pci_dev;
+@@ -474,6 +485,7 @@ apple_gfx_vblank_tick(void *opaque)
+ {
+     AppleGFXLinuxState *s = opaque;
+ 
++    trace_apple_gfx_vblank_tick();
+ 
+     /*
+      * Tick may have been queued before unrealize completed; lagfx_dev
+@@ -528,6 +540,7 @@ apple_gfx_frame_ready(void *opaque)
+         return;
+     }
+ 
++    trace_apple_gfx_new_frame();
+ 
+     aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                             apple_gfx_frame_ready_bh, opaque);
+@@ -538,6 +551,7 @@ apple_gfx_mode_changed(void *opaque, uint32_t width_px, uint32_t height_px)
+ {
+     AppleGFXLinuxState *s = opaque;
+ 
++    trace_apple_gfx_mode_change(width_px, height_px);
+ 
+     BQL_LOCK_GUARD();
+ 
+@@ -597,6 +611,7 @@ apple_gfx_cursor_glyph(void *opaque,
+     const uint8_t *src_px;
+ 
+     /* BPP is always 32 for QEMU cursors. */
++    trace_apple_gfx_cursor_set(32, width, height);
+ 
+     cursor = cursor_alloc(width, height);
+     cursor->hot_x = hotspot.x;
+@@ -644,6 +659,7 @@ apple_gfx_cursor_moved_bh(void *opaque)
+ static void
+ apple_gfx_cursor_moved(void *opaque)
+ {
++    trace_apple_gfx_cursor_move();
+     aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                              apple_gfx_cursor_moved_bh, opaque);
+ }
+@@ -654,6 +670,7 @@ apple_gfx_cursor_show(void *opaque, bool show)
+ {
+     AppleGFXLinuxState *s = opaque;
+ 
++    trace_apple_gfx_cursor_show(show);
+     s->cursor_show = show;
+ 
+     aio_bh_schedule_oneshot(qemu_get_aio_context(),
+@@ -671,6 +688,7 @@ apple_gfx_mmio_read(void *opaque, hwaddr offset, unsigned size)
+     /* libapplegfx-vulkan handles MMIO dispatch */
+     value = lagfx_mmio_read(s->lagfx_dev, offset);
+ 
++    trace_apple_gfx_read(offset, value);
+     return value;
+ }
+ 
+@@ -682,6 +700,7 @@ apple_gfx_mmio_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
+     /* libapplegfx-vulkan handles MMIO dispatch */
+     lagfx_mmio_write(s->lagfx_dev, offset, (uint32_t)val);
+ 
++    trace_apple_gfx_write(offset, val);
+ }
+ 
+ static const MemoryRegionOps apple_gfx_mmio_ops = {
+@@ -706,6 +725,7 @@ apple_gfx_common_init(Object *obj, AppleGFXLinuxState *s)
+     /* Default MMIO region size; libapplegfx may override */
+     size_t mmio_range_size = 0x4000;  /* 16 KB default */
+ 
++    trace_apple_gfx_common_init(object_get_typename(obj), mmio_range_size);
+ 
+     memory_region_init_io(&s->iomem_gfx, obj, &apple_gfx_mmio_ops, s,
+                           "apple-gfx-mmio", mmio_range_size);
+@@ -832,6 +852,7 @@ apple_gfx_common_realize(AppleGFXLinuxState *s, DeviceState *dev,
+     uint64_t next_fire = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                           NANOSECONDS_PER_SECOND / 60;
+     timer_mod(&s->vblank_timer, next_fire);
++    trace_apple_gfx_vblank_timer_registered(next_fire);
+ 
+     return true;
+ }
+diff --git a/hw/display/apple-gfx-pci-linux.c b/hw/display/apple-gfx-pci-linux.c
+index 7d4642695..6494f71f8 100644
+--- a/hw/display/apple-gfx-pci-linux.c
++++ b/hw/display/apple-gfx-pci-linux.c
+@@ -20,6 +20,7 @@
+ #include "hw/pci/msi.h"
+ #include "hw/core/qdev-properties.h"
+ #include "apple-gfx-linux.h"
++#include "trace.h"
+ 
+ /*
+  * Upper bound on the `gpu_cores` property. Leaves headroom above Mesa
+@@ -120,6 +121,7 @@ apple_gfx_pci_realize(PCIDevice *pci_dev, Error **errp)
+         return;
+     }
+ 
++    trace_apple_gfx_pci_realize();
+ }
+ 
+ static void
+@@ -131,6 +133,7 @@ apple_gfx_pci_reset(Object *obj, ResetType type)
+         lagfx_device_reset(s->common.lagfx_dev);
+     }
+ 
++    trace_apple_gfx_pci_reset();
+ }
+ 
+ static void
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 4bfc457fb..c3e80ea31 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -217,6 +217,14 @@ apple_gfx_common_init(const char *device_name, size_t mmio_size) "device: %s; MM
+ apple_gfx_common_realize_modes_property(uint32_t num_modes) "using %u modes supplied by 'display-modes' device property"
+ apple_gfx_display_mode(uint32_t mode_idx, uint16_t width_px, uint16_t height_px) "mode %2"PRIu32": %4"PRIu16"x%4"PRIu16
+ 
++# apple-gfx-pci-linux.c
++# apple-gfx-common-linux.c
++apple_gfx_pci_realize(void) ""
++apple_gfx_pci_reset(void) ""
++apple_gfx_write_memory(uint64_t phys_address, uint64_t length, const void *src) "phys_addr=0x%"PRIx64" length=0x%"PRIx64" src=%p"
++apple_gfx_vblank_tick(void) ""
++apple_gfx_vblank_timer_registered(uint64_t deadline) "first deadline=%"PRIu64" ns"
++
+ # apple-gfx-mmio.m
+ apple_gfx_mmio_iosfc_read(uint64_t offset, uint64_t res) "offset=0x%"PRIx64" res=0x%"PRIx64
+ apple_gfx_mmio_iosfc_write(uint64_t offset, uint64_t val) "offset=0x%"PRIx64" val=0x%"PRIx64
+-- 
+2.50.1 (Apple Git-155)
+

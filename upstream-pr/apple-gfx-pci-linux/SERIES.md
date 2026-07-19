@@ -1,3 +1,5 @@
+> **SUPERSEDED 2026-07-19:** this describes the v1 9-patch draft (never sent), now in `v1-draft/`. The current SEND-READY series is `v2/` (4 patches, external-library model, QEMU v11.0.2 base) — see `RFC-COVER.md`.
+
 # hw/display: add Linux-host port of apple-gfx-pci
 
 Upstream QEMU (since Phil Dennis-Jordan's series in 2024)

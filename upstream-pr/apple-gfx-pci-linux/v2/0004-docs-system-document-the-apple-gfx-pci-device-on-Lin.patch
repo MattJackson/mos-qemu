@@ -1,0 +1,98 @@
+From 763ebb24d1097195a5c27475d945798fc29f1a75 Mon Sep 17 00:00:00 2001
+From: Matthew Jackson <matthew@pq.io>
+Date: Sun, 19 Jul 2026 09:08:08 -0700
+Subject: [PATCH 4/4] docs/system: document the apple-gfx-pci device on Linux
+ hosts
+
+Describe the Linux-host build of the apple-gfx-pci paravirtualized
+graphics device: the libapplegfx-vulkan build dependency and configure
+option, the device properties, and current limitations.
+
+Signed-off-by: Matthew Jackson <matthew@pq.io>
+---
+ docs/system/device-emulation.rst        |  1 +
+ docs/system/devices/apple-gfx-linux.rst | 60 +++++++++++++++++++++++++
+ 2 files changed, 61 insertions(+)
+ create mode 100644 docs/system/devices/apple-gfx-linux.rst
+
+diff --git a/docs/system/device-emulation.rst b/docs/system/device-emulation.rst
+index 40054bb7d..3369f7685 100644
+--- a/docs/system/device-emulation.rst
++++ b/docs/system/device-emulation.rst
+@@ -84,6 +84,7 @@ Emulated Devices
+ 
+    devices/virtio/index.rst
+ 
++   devices/apple-gfx-linux.rst
+    devices/can.rst
+    devices/canokey.rst
+    devices/ccid.rst
+diff --git a/docs/system/devices/apple-gfx-linux.rst b/docs/system/devices/apple-gfx-linux.rst
+new file mode 100644
+index 000000000..88fe65481
+--- /dev/null
++++ b/docs/system/devices/apple-gfx-linux.rst
+@@ -0,0 +1,60 @@
++.. SPDX-License-Identifier: GPL-2.0-or-later
++
++Apple Paravirtualized Graphics on Linux hosts (``apple-gfx-pci``)
++=================================================================
++
++On macOS hosts, QEMU offers the ``apple-gfx-pci`` display device backed
++by Apple's ParavirtualizedGraphics.framework. On Linux hosts, the same
++guest-visible device is available when QEMU is built against
++`libapplegfx-vulkan <https://github.com/MattJackson/libapplegfx-vulkan>`__,
++an independent implementation of the host side of the paravirtualized
++graphics protocol with a Vulkan rendering backend.
++
++An unmodified macOS guest binds its stock ``AppleParavirtGPU.kext``
++driver to the device; no guest-side changes are required. Rendering
++works on any Vulkan implementation, including Mesa's software
++``lavapipe`` driver, so no host GPU is required.
++
++Build configuration
++-------------------
++
++The device is enabled automatically when the ``libapplegfx-vulkan``
++pkg-config package is found at configure time, and can be controlled
++explicitly with ``--enable-libapplegfx`` / ``--disable-libapplegfx``.
++The configure summary reports the detection result under
++``libapplegfx support``.
++
++Usage
++-----
++
++.. code-block:: console
++
++    qemu-system-x86_64 \
++        -machine q35,accel=kvm -cpu host -m 8G -smp 4 \
++        -device apple-gfx-pci \
++        ...
++
++Properties:
++
++``display-modes``
++    Array property listing the display modes advertised to the guest,
++    each formatted as ``<width>x<height>@<refresh-rate>``, for example
++    ``-device apple-gfx-pci,display-modes.0=1920x1080@60``.
++
++``gpu_cores``
++    Caps the rendering library's worker thread pool (for Mesa lavapipe
++    this sets ``LP_NUM_THREADS``). ``0`` (the default) lets the backend
++    pick its own default, typically the host core count. Useful on
++    large hosts where the renderer would otherwise over-schedule
++    against other guest work.
++
++Limitations
++-----------
++
++* Live migration is not supported; the device registers a migration
++  blocker.
++* The device provides no VGA or UEFI GOP compatibility surface, so
++  firmware and early-boot output are not displayed; the guest's
++  paravirtualized graphics driver must initialize before pixels
++  appear. Combine with a secondary VGA device if firmware output is
++  needed.
+-- 
+2.50.1 (Apple Git-155)
+

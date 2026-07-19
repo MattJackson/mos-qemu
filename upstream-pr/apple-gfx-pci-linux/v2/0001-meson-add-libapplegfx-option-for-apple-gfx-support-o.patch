@@ -1,0 +1,95 @@
+From ce0f8ced3272e440286e6a161ff891a29bf7b44f Mon Sep 17 00:00:00 2001
+From: Matthew Jackson <matthew@pq.io>
+Date: Sun, 19 Jul 2026 09:08:07 -0700
+Subject: [PATCH 1/4] meson: add libapplegfx option for apple-gfx support on
+ Linux hosts
+
+QEMU's apple-gfx device family (hw/display/apple-gfx*.m) implements the
+host side of Apple's paravirtualized graphics protocol on macOS hosts,
+backed by the ParavirtualizedGraphics.framework. An upcoming device
+provides the same guest-visible PCI device on Linux hosts, backed by
+libapplegfx-vulkan, an MIT-licensed clean-room implementation of the
+host side of the protocol with a Vulkan rendering backend.
+
+Add the meson plumbing for the new dependency: a 'libapplegfx' feature
+option (auto by default), pkg-config detection of libapplegfx-vulkan,
+and a configure summary entry. The library is only supported on Linux
+hosts; enabling the option elsewhere is a hard configure error.
+
+The library lives at https://github.com/MattJackson/libapplegfx-vulkan
+and ships a stable pkg-config manifest and semver ABI from v0.1.0.
+
+Signed-off-by: Matthew Jackson <matthew@pq.io>
+---
+ meson.build                   | 11 +++++++++++
+ meson_options.txt             |  2 ++
+ scripts/meson-buildoptions.sh |  4 ++++
+ 3 files changed, 17 insertions(+)
+
+diff --git a/meson.build b/meson.build
+index 51f5f2851..eb111c663 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1420,6 +1420,16 @@ if not get_option('rutabaga_gfx').auto() or have_system or have_vhost_user_gpu
+                          method: 'pkg-config',
+                          required: get_option('rutabaga_gfx'))
+ endif
++libapplegfx = not_found
++if host_os == 'linux'
++  if not get_option('libapplegfx').auto() or have_system
++    libapplegfx = dependency('libapplegfx-vulkan',
++                             method: 'pkg-config',
++                             required: get_option('libapplegfx'))
++  endif
++elif get_option('libapplegfx').enabled()
++  error('libapplegfx is only supported on Linux hosts')
++endif
+ blkio = not_found
+ if not get_option('blkio').auto() or have_block
+   blkio = dependency('blkio',
+@@ -5007,6 +5017,7 @@ if host_os == 'freebsd'
+ endif
+ if host_os == 'darwin'
+   summary_info += {'ParavirtualizedGraphics support': pvg}
++summary_info += {'libapplegfx support': libapplegfx}
+ endif
+ summary_info += {'valgrind':          valgrind}
+ summary(summary_info, bool_yn: true, section: 'Dependencies')
+diff --git a/meson_options.txt b/meson_options.txt
+index 31d5916cf..5bdefa7f1 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -252,6 +252,8 @@ option('virglrenderer', type : 'feature', value : 'auto',
+        description: 'virgl rendering support')
+ option('rutabaga_gfx', type : 'feature', value : 'auto',
+        description: 'rutabaga_gfx support')
++option('libapplegfx', type : 'feature', value : 'auto',
++       description: 'apple-gfx support on Linux hosts with libapplegfx-vulkan')
+ option('png', type : 'feature', value : 'auto',
+        description: 'PNG support with libpng')
+ option('vnc', type : 'feature', value : 'auto',
+diff --git a/scripts/meson-buildoptions.sh b/scripts/meson-buildoptions.sh
+index ca5b11311..640492d3b 100644
+--- a/scripts/meson-buildoptions.sh
++++ b/scripts/meson-buildoptions.sh
+@@ -135,6 +135,8 @@ meson_options_help() {
+   printf "%s\n" '  keyring         Linux keyring support'
+   printf "%s\n" '  kvm             KVM acceleration support'
+   printf "%s\n" '  l2tpv3          l2tpv3 network backend support'
++  printf "%s\n" '  libapplegfx     apple-gfx support on Linux hosts with
++                  libapplegfx-vulkan'
+   printf "%s\n" '  libcbor         libcbor support'
+   printf "%s\n" '  libdaxctl       libdaxctl support'
+   printf "%s\n" '  libdw           debuginfo support'
+@@ -365,6 +367,8 @@ _meson_option_parse() {
+     --disable-kvm) printf "%s" -Dkvm=disabled ;;
+     --enable-l2tpv3) printf "%s" -Dl2tpv3=enabled ;;
+     --disable-l2tpv3) printf "%s" -Dl2tpv3=disabled ;;
++    --enable-libapplegfx) printf "%s" -Dlibapplegfx=enabled ;;
++    --disable-libapplegfx) printf "%s" -Dlibapplegfx=disabled ;;
+     --enable-libcbor) printf "%s" -Dlibcbor=enabled ;;
+     --disable-libcbor) printf "%s" -Dlibcbor=disabled ;;
+     --enable-libdaxctl) printf "%s" -Dlibdaxctl=enabled ;;
+-- 
+2.50.1 (Apple Git-155)
+
