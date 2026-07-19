@@ -8,7 +8,7 @@
 # Triggered only on QEMU_VERSION bumps or manual workflow_dispatch —
 # this image rarely needs to rebuild.
 
-ARG QEMU_VERSION=11.0.0
+ARG QEMU_VERSION=11.0.2
 
 FROM alpine:3.21 AS builder
 ARG QEMU_VERSION

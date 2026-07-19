@@ -22,7 +22,7 @@
 # at /usr/share/qemu/. Nothing is intended to RUN from this image; it's
 # pure artifact.
 
-ARG QEMU_VERSION=11.0.0
+ARG QEMU_VERSION=11.0.2
 ARG LIBAPPLEGFX_SHA=main
 
 # ---------------------------------------------------------------------------

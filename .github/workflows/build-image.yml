@@ -46,7 +46,7 @@ on:
 # Pin QEMU version exactly to ci.yml (which validates against this version).
 # Bump in lockstep when upgrading.
 env:
-  QEMU_VERSION: '11.0.0'
+  QEMU_VERSION: '11.0.2'
   REGISTRY: ghcr.io
   OWNER: mattjackson
 

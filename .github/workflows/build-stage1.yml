@@ -31,7 +31,7 @@ on:
         default: '11.0.0'
 
 env:
-  QEMU_VERSION: '11.0.0'
+  QEMU_VERSION: '11.0.2'
   REGISTRY: ghcr.io
   OWNER: mattjackson
 

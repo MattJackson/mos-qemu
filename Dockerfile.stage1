@@ -22,7 +22,7 @@
 # This image is large (~2-3 GB) — that's intentional. It is consumed only
 # at CI build time, never deployed to runtime.
 
-ARG QEMU_VERSION=11.0.0
+ARG QEMU_VERSION=11.0.2
 
 FROM alpine:3.21
 ARG QEMU_VERSION
