@@ -1,8 +1,40 @@
-From bf46075e4110f4dbf6c994897b3d22e42d91af73 Mon Sep 17 00:00:00 2001
+From 90a15769754d90ff97e22ffab652031e87cbe49e Mon Sep 17 00:00:00 2001
+In-Reply-To: <20260507040153.14565-1-matthew@pq.io>
+References: <20260507040153.14565-1-matthew@pq.io>
 From: Matthew Jackson <matthew@pq.io>
-Date: Wed, 6 May 2026 20:54:40 -0700
-Subject: [PATCH 0/2] hw/misc/applesmc: fix GET_KEY_BY_INDEX iteration and
+Date: Thu, 7 May 2026 08:19:08 -0700
+Subject: [PATCH v3 0/2] hw/misc/applesmc: fix GET_KEY_BY_INDEX iteration and
  populate Apple SMC key set
+
+v3: rebased onto current master — no code changes. hw/misc/applesmc.c is
+unchanged upstream since v2 (2026-05-07), so the series applies as-is.
+Resending after the review thread went quiet.
+
+v1: https://lore.kernel.org/qemu-devel/20260507040153.14565-1-matthew@pq.io/
+
+Changes in v2 (all in patch 2/2, applesmc_isa_realize() #KEY block):
+
+  * Add braces around the QLIST_FOREACH() count loop body
+    (qemu coding style: loops always need braces, even single-line).
+    Reported-by: Peter Maydell <peter.maydell@linaro.org>
+
+  * Replace the manual 4-byte big-endian byte-shift packing of
+    `count` into `numkey_buf` with a single stl_be_p() call.
+    Reported-by: Peter Maydell <peter.maydell@linaro.org>
+
+Patch 1/2 is unchanged from v1.
+
+Peter also noted that the static-buffer "must remain valid forever"
+contract that applesmc_add_key() requires is awkward — fair, but
+fixing it (e.g. switching the key table to a glib hashtable that
+copies values) is independent from this series and not reported as
+performance-noticeable in profiles. Happy to follow up with a
+hashtable conversion as a separate series if the maintainers
+think it's worth doing.
+
+Original v1 cover letter follows below.
+
+---
 
 The QEMU applesmc device implements just enough of the Apple SMC PMIO
 protocol to satisfy the OSK boot check on older macOS versions. On
@@ -87,8 +119,8 @@ Matthew Jackson (2):
     WRITE/TYPE commands
   hw/misc/applesmc: populate Apple SMC key table
 
- hw/misc/applesmc.c | 344 ++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 337 insertions(+), 7 deletions(-)
+ hw/misc/applesmc.c | 346 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 338 insertions(+), 8 deletions(-)
 
 -- 
 2.50.1 (Apple Git-155)

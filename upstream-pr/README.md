@@ -10,11 +10,11 @@ description (`PR_DESCRIPTION.md`), and a testing recipe
 
 | Package | Subject | Size | Status |
 |---------|---------|-----:|--------|
-| [A](./applesmc-fix/) | Fix `GET_KEY_BY_INDEX` and populate Apple SMC key set | 2 patches | **SUBMITTED 2026-05-06**, **v2 sent 2026-05-07** addressing Maydell review ([lore v1](https://lore.kernel.org/qemu-devel/20260507040153.14565-1-matthew@pq.io/), [v2 search](https://lore.kernel.org/qemu-devel/20260507152020.48728-1-matthew@pq.io/)) |
+| [A](./applesmc-fix/) | Fix `GET_KEY_BY_INDEX` and populate Apple SMC key set | 2 patches | **v3 SENT 2026-07-19** (rebased resend after quiet thread; v1 2026-05-06, v2 2026-05-07 addressing Maydell review) ([lore v1](https://lore.kernel.org/qemu-devel/20260507040153.14565-1-matthew@pq.io/), [v2 search](https://lore.kernel.org/qemu-devel/20260507152020.48728-1-matthew@pq.io/)) |
 | [B](./apple-gfx-pci-linux/) | Linux-host port of `apple-gfx-pci` | 9 patches | **Blocked-ready** (library at `8edc43c`, packaging-path decision pending) — internal mos final-product helper, hold |
-| [C](./vmware-svga-caps/) | VMware SVGA II capability bits + 5K cap | 4 patches | **Ready to submit** |
+| [C](./vmware-svga-caps/) | VMware SVGA II capability bits + 5K cap | 4 patches | **v1 SENT 2026-07-19** (qemu-devel, Cc kraxel) |
 | ~~D~~ | ~~USB HID Apple vendor IDs~~ | — | **WITHDRAWN 2026-05-07** — descriptor-only wrappers were a wrong-shape solution; broke macOS recovery's HID stack. Superseded by Package E. |
-| [E](./apple-magic-hid/) | Apple Magic Keyboard + Magic Trackpad USB-mode emulators | 2 patches | **Ready to submit 2026-05-08** — real-protocol replacement for withdrawn Package D; binds `AppleUSBTopCaseHIDDriver` at probe score 90000; descriptors byte-identical to real hardware |
+| [E](./apple-magic-hid/) | Apple Magic Keyboard + Magic Trackpad USB-mode emulators | 2 patches | **v1 SENT 2026-07-19** (qemu-devel, Cc kraxel) — real-protocol replacement for withdrawn Package D; binds `AppleUSBTopCaseHIDDriver` at probe score 90000; descriptors byte-identical to real hardware |
 
 Ready-to-submit: A, C, E (3 of 5). B is "blocked-ready":
 the library side (`libapplegfx-vulkan`) has reached a stable
