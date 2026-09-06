@@ -16,4 +16,4 @@ Must build inside Alpine 3.21 (musl libc) — see README. **Do not** copy a glib
 
 ## License
 
-AGPL-3.0; QEMU-derived files inherit GPL-2.0+. Combined work satisfies both.
+GPL-2.0-or-later, matching upstream QEMU; QEMU-derived files retain GPL-2.0+.

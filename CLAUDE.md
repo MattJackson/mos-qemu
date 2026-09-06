@@ -37,9 +37,8 @@ and look up the relevant whitepaper or reference doc.
   job in `.github/workflows/ci.yml`).
 - **No `Co-Authored-By: Claude` trailers**, anywhere. Per the user's
   global rule.
-- **GPL-2.0-or-later** on QEMU-derived files (verbatim header).
-  AGPL-3.0 on the repo as a whole. The combined work is compatible
-  via AGPL-3.0 → GPL-3.0 → GPL-2.0-or-later.
+- **GPL-2.0-or-later** on QEMU-derived files (verbatim header) and on
+  the repo as a whole, matching upstream QEMU.
 - **Logging:** `qemu_log_mask(LOG_GUEST_ERROR, ...)`,
   `trace_*`, `warn_report`. No `printf` / bare `qemu_log` for
   runtime diagnostics.
