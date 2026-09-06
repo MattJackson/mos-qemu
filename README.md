@@ -1,5 +1,7 @@
 # mos-qemu
 
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/MattJackson)
+
 [![Build](https://github.com/MattJackson/mos-qemu/actions/workflows/build-image.yml/badge.svg)](https://github.com/MattJackson/mos-qemu/actions/workflows/build-image.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/mos-qemu?display_name=tag&sort=semver)](https://github.com/MattJackson/mos-qemu/releases)
 [![License: GPL-2.0-or-later](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
