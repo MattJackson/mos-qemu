@@ -106,7 +106,7 @@ scripts at this repo's root are the SSH-the-server shortcut form.
 
 ## License
 
-This repository carries [AGPL-3.0](LICENSE) on its additions.
-Upstream-derived files retain GPL-2.0-or-later as required by QEMU's
-licensing. The combined work satisfies both via the AGPL-3.0 →
-GPL-3.0 → GPL-2.0-or-later compatibility chain.
+This repository is licensed [GPL-2.0-or-later](LICENSE), matching
+upstream QEMU. Upstream-derived files retain their `GPL-2.0-or-later`
+headers verbatim as required by QEMU's licensing, and new files carry
+the same identifier.

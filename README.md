@@ -1,5 +1,9 @@
 # mos-qemu
 
+[![Build](https://github.com/MattJackson/mos-qemu/actions/workflows/build-image.yml/badge.svg)](https://github.com/MattJackson/mos-qemu/actions/workflows/build-image.yml)
+[![Release](https://img.shields.io/github/v/release/MattJackson/mos-qemu?display_name=tag&sort=semver)](https://github.com/MattJackson/mos-qemu/releases)
+[![License: GPL-2.0-or-later](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
+
 QEMU 11.0.0 patches for running unmodified macOS 15 (Sequoia) as a
 guest on Linux + KVM. Three overlay files plus one new device that
 implements the host side of Apple's **ParavirtualizedGraphics**
@@ -80,7 +84,7 @@ docker run --rm -v /tmp/qemu-11.0.0:/src -v /tmp:/out alpine:3.21 sh -c '
       glib-dev pixman-dev libcap-ng-dev libseccomp-dev \
       libslirp-dev libaio-dev dtc-dev
   # libapplegfx-vulkan must be installed BEFORE configure for apple-gfx-pci.
-  # Build + install it from source (also AGPL-3.0):
+  # Build + install it from source (MIT-licensed):
   apk add --no-cache git mesa-dev vulkan-headers vulkan-loader-dev mesa-vulkan-swrast
   git clone https://github.com/MattJackson/libapplegfx-vulkan /tmp/libapplegfx
   cd /tmp/libapplegfx && meson setup --prefix=/usr build && ninja -C build install
@@ -203,19 +207,29 @@ that flow through `apple-gfx-pci`'s BAR0 doorbell). Top-line state
 across the six repos lives at
 [mos-docs/overview/project-status.md](https://github.com/MattJackson/mos-docs/blob/main/overview/project-status.md).
 
+## Contributing
+
+Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md)
+for upstream-submission discipline and commit style, and
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for community expectations.
+
+## Security
+
+To report a vulnerability, follow the process in
+[`SECURITY.md`](SECURITY.md).
+
+## Changelog
+
+Release history is tracked in [`CHANGELOG.md`](CHANGELOG.md).
+
 ## License
 
-[GNU AGPL-3.0](LICENSE) on additions in this repo. QEMU-derived files
-(`applesmc.c`, `vmware_vga.c`, `dev-hid.c`) retain upstream's
-GPL-2.0-or-later headers verbatim — the combined work satisfies
-both via the AGPL-3.0 → GPL-3.0 → GPL-2.0-or-later compatibility
-chain. The new `apple-gfx-pci-linux.c` carries `SPDX-License-Identifier:
+[GNU GPL-2.0-or-later](LICENSE), matching upstream QEMU. QEMU-derived
+files (`applesmc.c`, `vmware_vga.c`, `dev-hid.c`) retain upstream's
+`GPL-2.0-or-later` headers verbatim, and the new
+`apple-gfx-pci-linux.c` carries `SPDX-License-Identifier:
 GPL-2.0-or-later` matching upstream's `apple-gfx-pci.m`, in
 preparation for upstream submission.
-
-See also: [`CONTRIBUTING.md`](CONTRIBUTING.md) (upstream-submission
-discipline, commit style), [`SECURITY.md`](SECURITY.md) (advisories),
-[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md), [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Keywords
 

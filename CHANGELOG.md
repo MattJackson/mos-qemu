@@ -69,9 +69,9 @@ Linux, built against QEMU 10.2.2.
 - Patches are tracked in this fork as standalone files and overlay-copied
   onto an unpacked QEMU 10.2.2 source tree before `configure` / `make`.
   See `README.md` for the build recipe.
-- Licensing: this fork is AGPL-3.0; QEMU-derived files retain their
-  upstream GPL-2.0-or-later licensing. The combined work satisfies both
-  (AGPL-3.0 implies GPL-3.0, which is compatible with GPL-2.0-or-later).
+- Licensing: this fork is GPL-2.0-or-later, matching upstream QEMU.
+  QEMU-derived files retain their upstream GPL-2.0-or-later licensing,
+  and new files carry the same identifier.
 
 [Unreleased]: https://github.com/MattJackson/mos-qemu/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/MattJackson/mos-qemu/releases/tag/v0.6.0
